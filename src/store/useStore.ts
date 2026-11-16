@@ -1,0 +1,212 @@
+import { create } from 'zustand'
+import { DEFAULT_CONFIG, KIND_INFO, type Architecture, type ArchComponent, type ComponentKind, type Slo } from './types'
+import { initialArchitecture } from './project'
+import { findFreeCell } from './arch'
+
+export type ConnectResult = 'ok' | 'self' | 'duplicate' | 'reverse'
+type Cell = { col: number; row: number }
+
+interface UIState {
+  architecture: Architecture
+  /** When the design was last written to browser storage (null until the first save). */
+  savedAt: number | null
+  past: Architecture[]
+  future: Architecture[]
+  selectedId: string | null
+  selectedConnId: string | null
+  dragKind: ComponentKind | null
+  hoverCell: Cell | null
+  hoverId: string | null
+  ctx: { id: string; x: number; y: number } | null
+  /** Design A for compare mode: a snapshot of the architecture at the time it was pinned. */
+  pinned: { arch: Architecture; at: number } | null
+  review: { open: boolean; tab: 'review' | 'compare' | 'capacity' }
+  leftOpen: boolean
+  rightOpen: boolean
+
+  select: (id: string | null) => void
+  selectConn: (id: string | null) => void
+  setDragKind: (k: ComponentKind | null) => void
+  setHoverCell: (c: Cell | null) => void
+  setHoverId: (id: string | null) => void
+  openCtx: (id: string, x: number, y: number) => void
+  setSavedAt: (t: number) => void
+  /** Replace the whole design with another (a preset, an import, a blank canvas) as one undo step. */
+  loadArchitecture: (arch: Architecture) => void
+  renameProject: (name: string) => void
+  /** Change the service-level targets. Not part of the undo history, and does not restart the run. */
+  setSlo: (patch: Partial<Slo>) => void
+  pin: () => void
+  unpin: () => void
+  setReview: (open: boolean, tab?: 'review' | 'compare' | 'capacity') => void
+  /** Replace the whole design as ONE undo step (used by suggested fixes). Pins the previous design as A if none is pinned. */
+  applyArchitecture: (arch: Architecture) => void
+  closeCtx: () => void
+  toggleLeft: () => void
+  toggleRight: () => void
+
+  addComponent: (kind: ComponentKind, col: number, row: number) => string
+  /** Add next to (near) or at the first free slot. Returns null if the canvas is full. */
+  addNear: (kind: ComponentKind, near: Cell) => string | null
+  moveComponent: (id: string, col: number, row: number) => void
+  removeComponent: (id: string) => void
+  duplicateComponent: (id: string) => void
+  renameComponent: (id: string, name: string) => void
+  updateConfig: (id: string, key: string, value: number) => void
+  /** Several settings as one undo step (e.g. Scale up). */
+  updateConfigs: (id: string, patch: Record<string, number>) => void
+  addConnection: (from: string, to: string) => ConnectResult
+  removeConnection: (id: string) => void
+  undo: () => void
+  redo: () => void
+}
+
+let counter = 100
+const uid = (p: string) => `${p}-${++counter}`
+let lastEdit = { key: '', at: 0 }
+
+const commit = (s: UIState, architecture: Architecture) => ({ architecture, past: [...s.past, s.architecture].slice(-50), future: [] as Architecture[] })
+
+function makeComponent(arch: Architecture, kind: ComponentKind, col: number, row: number): ArchComponent {
+  const n = arch.components.filter((c) => c.kind === kind).length + 1
+  const config = { ...DEFAULT_CONFIG[kind] }
+  return { id: uid(kind), kind, name: n > 1 ? `${KIND_INFO[kind].label} ${n}` : KIND_INFO[kind].label, position: { col, row }, config, assumed: Object.keys(config) }
+}
+
+export const useStore = create<UIState>((set, get) => ({
+  architecture: initialArchitecture(),
+  savedAt: null,
+  past: [],
+  future: [],
+  selectedId: null,
+  selectedConnId: null,
+  dragKind: null,
+  hoverCell: null,
+  hoverId: null,
+  ctx: null,
+  pinned: null,
+  review: { open: false, tab: 'review' },
+  leftOpen: true,
+  rightOpen: true,
+
+  select: (id) => set((s) => ({ selectedId: id, selectedConnId: null, rightOpen: id ? true : s.rightOpen })),
+  selectConn: (id) => set((s) => ({ selectedConnId: id, selectedId: null, rightOpen: id ? true : s.rightOpen })),
+  setDragKind: (dragKind) => set({ dragKind }),
+  setHoverCell: (hoverCell) => set({ hoverCell }),
+  setHoverId: (hoverId) => set({ hoverId }),
+  openCtx: (id, x, y) => set({ ctx: { id, x, y }, selectedId: id, selectedConnId: null, hoverId: null }),
+  closeCtx: () => set({ ctx: null }),
+  setSavedAt: (savedAt) => set({ savedAt }),
+  loadArchitecture: (arch) => {
+    const s = get()
+    lastEdit = { key: '', at: 0 }
+    set({ ...commit(s, arch), selectedId: null, selectedConnId: null, hoverId: null, ctx: null, pinned: null })
+  },
+  renameProject: (name) => set((s) => ({ architecture: { ...s.architecture, name: name.slice(0, 60) } })),
+  setSlo: (patch) => set((s) => ({ architecture: { ...s.architecture, slo: { availability: 0.995, p99Ms: 500, ...s.architecture.slo, ...patch } } })),
+  pin: () => set((s) => ({ pinned: { arch: s.architecture, at: Date.now() } })),
+  unpin: () => set({ pinned: null }),
+  setReview: (open, tab) => set((s) => ({ review: { open, tab: tab ?? s.review.tab } })),
+  applyArchitecture: (arch) => {
+    const s = get()
+    lastEdit = { key: '', at: 0 }
+    set({ ...commit(s, arch), ...pruneSelection(s, arch), pinned: s.pinned ?? { arch: s.architecture, at: Date.now() } })
+  },
+  toggleLeft: () => set((s) => ({ leftOpen: !s.leftOpen })),
+  toggleRight: () => set((s) => ({ rightOpen: !s.rightOpen })),
+
+  addComponent: (kind, col, row) => {
+    const s = get()
+    const c = makeComponent(s.architecture, kind, col, row)
+    set({ ...commit(s, { ...s.architecture, components: [...s.architecture.components, c] }), selectedId: c.id, selectedConnId: null, rightOpen: true })
+    return c.id
+  },
+  addNear: (kind, near) => {
+    const spot = findFreeCell(get().architecture, near.col, near.row)
+    return spot ? get().addComponent(kind, spot.col, spot.row) : null
+  },
+  moveComponent: (id, col, row) => {
+    const s = get()
+    set(commit(s, { ...s.architecture, components: s.architecture.components.map((c) => (c.id === id ? { ...c, position: { col, row } } : c)) }))
+  },
+  removeComponent: (id) => {
+    const s = get()
+    set({
+      ...commit(s, { ...s.architecture, components: s.architecture.components.filter((c) => c.id !== id), connections: s.architecture.connections.filter((c) => c.from !== id && c.to !== id) }),
+      selectedId: s.selectedId === id ? null : s.selectedId,
+      selectedConnId: null,
+    })
+  },
+  duplicateComponent: (id) => {
+    const s = get()
+    const src = s.architecture.components.find((c) => c.id === id)
+    if (!src) return
+    const spot = findFreeCell(s.architecture, src.position.col + 2, src.position.row)
+    if (!spot) return
+    const copy = { ...makeComponent(s.architecture, src.kind, spot.col, spot.row), config: { ...src.config }, assumed: src.assumed ? [...src.assumed] : undefined }
+    set({ ...commit(s, { ...s.architecture, components: [...s.architecture.components, copy] }), selectedId: copy.id, selectedConnId: null })
+  },
+  renameComponent: (id, name) => {
+    const s = get()
+    const now = Date.now()
+    const coalesce = lastEdit.key === `name:${id}` && now - lastEdit.at < 800
+    lastEdit = { key: `name:${id}`, at: now }
+    const architecture = { ...s.architecture, components: s.architecture.components.map((c) => (c.id === id ? { ...c, name } : c)) }
+    set(coalesce ? { architecture } : commit(s, architecture))
+  },
+  updateConfig: (id, key, value) => {
+    const s = get()
+    const now = Date.now()
+    const coalesce = lastEdit.key === `${id}:${key}` && now - lastEdit.at < 800
+    lastEdit = { key: `${id}:${key}`, at: now }
+    const architecture = {
+      ...s.architecture,
+      components: s.architecture.components.map((c) => (c.id === id ? { ...c, config: { ...c.config, [key]: value }, assumed: c.assumed?.filter((k) => k !== key) } : c)),
+    }
+    set(coalesce ? { architecture } : commit(s, architecture))
+  },
+  updateConfigs: (id, patch) => {
+    const s = get()
+    lastEdit = { key: '', at: 0 }
+    const keys = Object.keys(patch)
+    set(commit(s, {
+      ...s.architecture,
+      components: s.architecture.components.map((c) => (c.id === id ? { ...c, config: { ...c.config, ...patch }, assumed: c.assumed?.filter((k) => !keys.includes(k)) } : c)),
+    }))
+  },
+  addConnection: (from, to) => {
+    const s = get()
+    if (from === to) return 'self'
+    const cs = s.architecture.connections
+    if (cs.some((c) => c.from === from && c.to === to)) return 'duplicate'
+    if (cs.some((c) => c.from === to && c.to === from)) return 'reverse'
+    set(commit(s, { ...s.architecture, connections: [...cs, { id: uid('conn'), from, to }] }))
+    return 'ok'
+  },
+  removeConnection: (id) => {
+    const s = get()
+    set({ ...commit(s, { ...s.architecture, connections: s.architecture.connections.filter((c) => c.id !== id) }), selectedConnId: null })
+  },
+  undo: () => {
+    const s = get()
+    const prev = s.past[s.past.length - 1]
+    if (!prev) return
+    set({ architecture: prev, past: s.past.slice(0, -1), future: [s.architecture, ...s.future], ...pruneSelection(s, prev) })
+  },
+  redo: () => {
+    const s = get()
+    const next = s.future[0]
+    if (!next) return
+    set({ architecture: next, past: [...s.past, s.architecture], future: s.future.slice(1), ...pruneSelection(s, next) })
+  },
+}))
+
+function pruneSelection(s: UIState, a: Architecture) {
+  return {
+    selectedId: s.selectedId && a.components.some((c) => c.id === s.selectedId) ? s.selectedId : null,
+    selectedConnId: s.selectedConnId && a.connections.some((c) => c.id === s.selectedConnId) ? s.selectedConnId : null,
+  }
+}
+
+/** True when the components or connections changed. Renaming, or changing targets, is not a change to the design itself. */
+export const designChanged = (a: Architecture, b: Architecture) => a.components !== b.components || a.connections !== b.connections

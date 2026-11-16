@@ -1,0 +1,26 @@
+/* Single source of truth for the design system.
+   Tailwind and the PixiJS canvas (via lib/theme.ts) both read these. */
+:root {
+  color-scheme: light;
+  --bp-bg: #f2f6fb;        /* drafting paper */
+  --bp-surface: #ffffff;
+  --bp-grid: #3a7bd5;
+  --bp-line: #1f4f8a;      /* ink */
+  --bp-text: #10243e;
+  --bp-text-dim: #5a7089;
+  --bp-accent: #0b7fd1;
+
+  --status-healthy: #12a36a;
+  --status-strained: #d98a0b;
+  --status-failed: #d93b3b;
+
+  /* space reserved at the bottom for the dock (timeline + metrics) */
+  --dock: 6.25rem;
+  --radius-control: 6px;
+  --radius-panel: 10px;
+
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --dur-slow: 320ms;
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
