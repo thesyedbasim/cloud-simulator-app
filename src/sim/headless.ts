@@ -4,7 +4,7 @@
  */
 import type { Architecture } from '../store/types'
 import { freshState, step, type Injected } from './engine'
-import { planScenario, SCENARIOS, type ScenarioId } from './scenarios'
+import { planScenario, SUITE_IDS, type ScenarioId } from './scenarios'
 import { accumulate, sloOf, sloStatus, zeroCounters, type SloStatus } from './slo'
 
 /** A scenario "survives" if errors never exceed this share of requests. */
@@ -46,11 +46,13 @@ export function runScenario(arch: Architecture, id: ScenarioId, seconds = RUN_SE
   let state = freshState()
   let injected: Record<string, Injected> = {}
   let fired = false
+  let cleared = false
   const slo = sloOf(arch)
   let counters = zeroCounters()
   const steps = seconds * 10
   for (let i = 0; i <= steps; i++) {
     if (!fired && state.t >= plan.at) { injected = plan.injections; fired = true }
+    else if (fired && !cleared && plan.until !== undefined && state.t >= plan.until) { injected = {}; cleared = true }
     const out = step(arch, state, i === 0 ? 0 : 0.1, { shape: plan.shape ?? 'steady', injected })
     state = out.state
     const tot = out.result.totals
@@ -84,8 +86,8 @@ export interface Suite {
   cost: number
 }
 
-export function runSuite(arch: Architecture): Suite {
-  const runs = SCENARIOS.map((s) => runScenario(arch, s.id))
+export function runSuite(arch: Architecture, ids: ScenarioId[] = SUITE_IDS): Suite {
+  const runs = ids.map((id) => runScenario(arch, id))
   const live = runs.filter((r) => !r.skipped)
   return {
     runs,

@@ -113,3 +113,20 @@ Every component has a level derived from the settings that make it more capable,
 **Stampede.** Without *request coalescing*, many requests for the same missing item each load it separately, so a cold cache forwards `misses × (1 + 2 × (1 − warmth))`: up to 3× the misses right after a flush. With coalescing on (one load per missing key) the misses are forwarded as they are. The factor 2 is an assumption, not a measurement.
 
 **Circuit breaker.** App servers can have one (off by default). It watches the share of its downstream calls that fail end to end (a request counts as failed if it is dropped anywhere behind this tier, weighted by how much of this tier's traffic reaches each hop; calls that ran past the call timeout count too). Closed → opens when that share is over the threshold (default 25 %). Open: requests fail fast here, and nothing is sent downstream, which also releases blocked workers. After the open time (default 10 s) it goes half-open: 10 % of requests are let through for 2 s; if the failure share is under the threshold it closes, otherwise it opens again. Because only a trickle is let through, a downstream that is still slow can look healthy at 10 %, so a breaker can cycle open and closed while the problem lasts. That is how real breakers behave too. A tier fronted by a cache sees a smaller failure share than the database behind it (hits succeed), so the threshold may need to be lower than you would expect.
+
+## More failure scenarios (Stage 4)
+
+Scenarios are listed in the Scenarios menu and the compare view. Six were added. The **stress suite** (the review, the fix search and the "failing" badge) still runs only the original three (`SUITE_IDS`), so it stays quick; the new ones are run from the menu or the compare view.
+
+| Scenario | What happens | Faults used |
+| --- | --- | --- |
+| Cache flush | Every cache and CDN empties at 5 s and refills from cold | `flushed` |
+| Retry storm | The first app tier is 4× slower from 5 s to 15 s, then recovers on its own | `slow`, lifted at 15 s |
+| Zone outage | Half of every app tier (the larger zone) and every database primary are lost at 5 s | `zoneLoss`, `killed` |
+| Gray failure | The first app tier is 4× slower but still passes health checks, so a load balancer keeps sending it traffic (only a *down* target fails a probe) | `slow` |
+| Bad deploy | A faulty release makes 30 % of an app tier's requests fail; capacity is fine. Restore it to roll back | `bad` |
+| Thundering herd | All app tiers are down from 5 s to 13 s and caches come back empty, so the returning load meets a cold cache | `killed` + `flushed`, servers lifted at 13 s |
+
+New faults: `zoneLoss` (a lone instance is down; otherwise `floor(n/2)` of `n` instances remain, and an autoscaler counts the lost ones as dead), `bad` (served × 0.7; the 30 % is an assumed figure). A scenario can now have an `until` time at which its faults are lifted, which is what makes a brief failure possible. The Faults panel has matching buttons (Flush, Lose a zone, Bad release).
+
+**Not modelled yet:** a canary or staged rollout (a bad release always reaches the whole tier), DNS/TTL lag, a slow memory leak (gradual degradation).

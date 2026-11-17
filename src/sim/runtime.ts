@@ -35,7 +35,7 @@ function timelineOf(): Timeline | null {
 interface History { p50: number[]; p99: number[]; err: number[]; rps: number[]; cost: number[] }
 const emptyHistory = (): History => ({ p50: [], p99: [], err: [], rps: [], cost: [] })
 
-interface ActiveScenario { plan: ScenarioPlan; fired: boolean; prevShape: TrafficShape }
+interface ActiveScenario { plan: ScenarioPlan; fired: boolean; prevShape: TrafficShape; cleared?: boolean }
 
 interface SimUI {
   running: boolean
@@ -164,7 +164,16 @@ let insightNow: Insight | null = null
 /** Lands the scenario's fault once its baseline period is over. */
 function fireIfDue() {
   const sc = useSim.getState().scenario
-  if (!sc || sc.fired || state.t < sc.plan.at) return
+  if (!sc) return
+  if (sc.fired && !sc.cleared && sc.plan.until !== undefined && state.t >= sc.plan.until) {
+    // a brief failure: the faults are lifted, and what matters now is whether the system recovers on its own
+    const injected = { ...useSim.getState().injected }
+    for (const id of Object.keys(sc.plan.injections)) delete injected[id]
+    useSim.setState({ scenario: { ...sc, cleared: true }, injected })
+    toast(`${sc.plan.label}: faults lifted`, { description: 'Watch whether the system recovers by itself.' })
+    return
+  }
+  if (sc.fired || state.t < sc.plan.at) return
   useSim.setState({ scenario: { ...sc, fired: true }, injected: { ...useSim.getState().injected, ...sc.plan.injections } })
   if (Object.keys(sc.plan.injections).length) toast.warning(`${sc.plan.label}: fault injected`, { description: sc.plan.summary })
 }

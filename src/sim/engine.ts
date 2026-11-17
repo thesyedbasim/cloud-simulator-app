@@ -11,8 +11,8 @@ import { shareSlowerThan } from './latency'
 
 export type Health = 'healthy' | 'strained' | 'failed'
 export type TrafficShape = 'steady' | 'spike' | 'daily' | 'flash' | 'ramp'
-/** killed = down; slow = 4× latency and ¼ capacity; lostInstance = one instance of a scaled-out tier dies (a lone instance = down); flushed = a cache or CDN loses everything it held and starts cold. */
-export type Injected = 'killed' | 'slow' | 'lostInstance' | 'flushed'
+/** killed = down; slow = 4× latency and ¼ capacity; lostInstance = one instance of a scaled-out tier dies (a lone instance = down); flushed = a cache or CDN loses everything it held and starts cold; zoneLoss = a failure zone is lost (half the instances of a scaled-out tier, rounded up; a lone instance = down); bad = a bad release (capacity is fine but a share of requests error out). */
+export type Injected = 'killed' | 'slow' | 'lostInstance' | 'flushed' | 'zoneLoss' | 'bad'
 
 export const SHAPES: { id: TrafficShape; label: string }[] = [
   { id: 'steady', label: 'Steady' },
@@ -46,6 +46,8 @@ const MAX_HOLD = 20
 /** Ordinary queueing downstream (latency up to 15% over its idle value) is normal and does not hold workers longer. */
 const HOLD_GRACE = 1.15
 const SLOW_FACTOR = 4
+/** Share of requests a bad release makes fail. */
+export const BAD_RELEASE_RATE = 0.3
 
 /** Autoscaling bookkeeping for one app tier. */
 export interface ScaleState {
@@ -161,6 +163,7 @@ function capacityOf(c: ArchComponent, instances: number, inj: Injected | undefin
   }
   if (inj === 'killed') capacity = 0
   else if (inj === 'lostInstance') capacity = c.kind === 'appServers' && instances > 1 ? (capacity * (instances - 1)) / instances : 0
+  else if (inj === 'zoneLoss') capacity = c.kind === 'appServers' && instances > 1 ? (capacity * Math.floor(instances / 2)) / instances : 0 // the larger zone is the one that fails
   else if (inj === 'slow' && c.kind !== 'database') capacity /= SLOW_FACTOR
   else if (inj === 'slow') capacity = Math.min(capacity, dbCapacity(cfg).rps / SLOW_FACTOR)
   return capacity
@@ -287,7 +290,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       const pendingN = pending.reduce((a, p) => a + p.n, 0)
       // A lost instance still counts towards the group's size but serves nothing, so it is replaced like any
       // unhealthy instance. A tier that is entirely down cannot be helped by more instances, so it does not scale.
-      const dead = inj === 'lostInstance' ? 1 : 0
+      const dead = inj === 'lostInstance' ? 1 : inj === 'zoneLoss' ? Math.ceil(active / 2) : 0
       if (dt > 0 && inj !== 'killed') {
         const need = Math.ceil(offered / (per * target)) // healthy instances needed to run at the target load
         const healthy = active - dead + pendingN
@@ -347,7 +350,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       served = Math.max(0, offered - dropped - (dt > 0 ? (d - prevDepth) / dt : 0))
       nextQueue[id] = d
     } else {
-      served = (failing ? Math.min(offered * readShare, capacity) : Math.min(offered, Math.max(0, capacity - blockLoad) / unit)) * (1 - callFail) // calls that timed out are failures here
+      served = (failing ? Math.min(offered * readShare, capacity) : Math.min(offered, Math.max(0, capacity - blockLoad) / unit)) * (1 - callFail) * (inj === 'bad' ? 1 - BAD_RELEASE_RATE : 1) // calls that timed out, or hit a bad release, are failures here
       dropped = offered - served
     }
 

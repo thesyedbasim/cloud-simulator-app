@@ -19,6 +19,18 @@ function why(c: ArchComponent, n: NodeResult): { title: string; reasons: string[
   const cfg = c.config
   const dropPct = n.offered > 0 ? Math.round((n.dropped / n.offered) * 100) : 0
 
+  if (n.injected === 'bad') {
+    return {
+      kind: 'bad',
+      title: `${name} is running a bad release`,
+      reasons: [
+        `A faulty release makes about 30% of the requests ${name} handles fail, even though it has the capacity (it is at ${Math.round(n.util * 100)}% utilization).`,
+        `${dropPct}% of requests to it fail. Clients retry them, which adds load on top of the bug.`,
+      ],
+      hint: 'Roll back (restore it from the inspector). A canary release would have exposed only a small share of traffic to the bug.',
+    }
+  }
+
   if (c.kind === 'appServers' && (n.breaker === 'open' || n.breaker === 'half')) {
     return {
       kind: 'breaker',
@@ -62,6 +74,10 @@ function why(c: ArchComponent, n: NodeResult): { title: string; reasons: string[
   if (n.injected === 'slow') {
     kind = 'slow'
     reasons.push(`${name} is running slowly: about 4× normal latency and a quarter of its usual capacity.`)
+  } else if (n.injected === 'zoneLoss') {
+    kind = 'degraded'
+    const inst = n.scaling?.active ?? cfg.instances ?? 2
+    reasons.push(`A failure zone is down: ${Math.ceil(inst / 2)} of ${inst} instances of ${name} are gone, so it has lost ${Math.round((Math.ceil(inst / 2) / inst) * 100)}% of its capacity.`)
   } else if (n.injected === 'lostInstance') {
     kind = 'degraded'
     const inst = n.scaling?.active ?? cfg.instances ?? 2
@@ -115,7 +131,7 @@ function why(c: ArchComponent, n: NodeResult): { title: string; reasons: string[
       break
   }
   if (n.injected) hint += ' You injected this fault; restore it from the inspector.'
-  const title = kind === 'slow' ? `${name} is slow` : kind === 'degraded' ? `${name} lost an instance` : `${name} is the bottleneck`
+  const title = kind === 'slow' ? `${name} is slow` : kind === 'degraded' ? `${name} lost capacity` : `${name} is the bottleneck`
   return { title, reasons, hint, kind }
 }
 
