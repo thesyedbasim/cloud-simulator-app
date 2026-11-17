@@ -29,6 +29,39 @@ export function functionCost(c: Record<string, number>): number {
 
 export type Limiter = 'CPU' | 'RAM'
 
+/** A hot key sends this share of a sharded store's or a partitioned queue's traffic to one shard or partition. An assumed figure. */
+export const HOT_KEY_SHARE = 0.6
+/** A poison message is retried this many times before it is given up on (or sent to the dead-letter queue after one failure). */
+export const POISON_RETRY_COST = 20
+
+export const dbShards = (c: Record<string, number>) => Math.max(1, Math.round(c.shards ?? 1))
+/** Share of a database's traffic that lands on its busiest shard (1 for an unsharded database). */
+export function dbHotShare(c: Record<string, number>, hotKey = false): number {
+  const s = dbShards(c)
+  if (s === 1) return 1
+  return Math.min(1, Math.max(1 / s, c.hotShare ?? 0, hotKey ? HOT_KEY_SHARE : 0))
+}
+
+/** Partitioned queues (a broker with a consumer group): partitions, consumers, and the busiest partition's share. */
+export const isBroker = (c: Record<string, number>) => Math.round(c.partitions ?? 0) > 0
+export function brokerShape(c: Record<string, number>, hotKey = false) {
+  const partitions = Math.max(1, Math.round(c.partitions ?? 1))
+  const consumers = Math.max(1, Math.round(c.consumers ?? 1))
+  const active = Math.min(consumers, partitions) // a partition is read by one consumer in the group, so extra consumers sit idle
+  const hot = Math.min(1, Math.max(1 / partitions, c.hotKeyShare ?? 0, hotKey ? HOT_KEY_SHARE : 0))
+  return { partitions, consumers, active, hot, idle: Math.max(0, consumers - partitions) }
+}
+/** Messages per second a queue can drain right now. */
+export function queueDrain(c: Record<string, number>, hotKey = false): number {
+  const rate = c.capacity ?? 400
+  if (!isBroker(c)) return rate
+  const b = brokerShape(c, hotKey)
+  let drain = Math.min(b.active * rate, rate / b.hot) // the busiest partition has one reader, so it caps the whole group
+  const poison = c.poisonPct ?? 0
+  drain /= 1 + poison * ((c.dlq ?? 0) >= 0.5 ? 1 : POISON_RETRY_COST) // a poison message with no dead-letter queue is retried over and over, holding up its partition
+  return drain
+}
+
 export function appCapacityPerInstance(c: Record<string, number>): { rps: number; limiter: Limiter } {
   const cpu = (c.vcpu ?? 4) * RPS_PER_VCPU_APP
   const mem = (c.ramGb ?? 8) * RPS_PER_GB_APP
@@ -47,9 +80,9 @@ export function hourlyCost(kind: ComponentKind, c: Record<string, number>): numb
     case 'client': return ((c.rps ?? 0) * 3600 * (configValue('client', c, 'payloadKb') ?? 4)) / 1e6 * EGRESS_USD_PER_GB // data transfer out
     case 'loadBalancer': return 0.03
     case 'appServers': return (c.instances ?? 1) * ((c.vcpu ?? 4) * 0.03 + (c.ramGb ?? 8) * 0.005)
-    case 'database': return ((c.vcpu ?? 4) * 0.06 + (c.ramGb ?? 16) * 0.01) * (1 + (c.replicas ?? 0)) + ((c.pooler ?? 0) >= 0.5 ? (c.vcpu ?? 4) * 0.015 : 0) // each replica is a full copy; a proxy is billed per vCPU
+    case 'database': return (((c.vcpu ?? 4) * 0.06 + (c.ramGb ?? 16) * 0.01) * (1 + (c.replicas ?? 0)) + ((c.pooler ?? 0) >= 0.5 ? (c.vcpu ?? 4) * 0.015 : 0)) * dbShards(c) // each replica is a full copy; a proxy is billed per vCPU; every shard is a full database
     case 'cache': return 0.03 + 0.04 * Math.pow((c.hitRate ?? 0.8) / 0.8, 3) // a bigger cache (higher hit rate) costs more
-    case 'queue': return 0.04
+    case 'queue': return 0.04 + (isBroker(c) ? 0.03 * Math.round(c.consumers ?? 1) + 0.01 * Math.round(c.partitions ?? 1) : 0)
     case 'cdn': return 0.04 + 0.06 * Math.pow((c.hitRate ?? 0.9) / 0.9, 3)
     case 'bucket': return 0.01 + ((c.storageGb ?? 500) * 0.023) / 730 // storage billed per GB-month
     case 'gateway': return 0.05
@@ -61,9 +94,9 @@ export function hourlyCost(kind: ComponentKind, c: Record<string, number>): numb
 export function specLine(kind: ComponentKind, c: Record<string, number>): string {
   switch (kind) {
     case 'appServers': return `${(c.autoscale ?? 0) >= 0.5 ? `${c.instances ?? 1}–${c.maxInstances ?? 8}` : (c.instances ?? 1)} × ${c.vcpu ?? 4} vCPU · ${c.ramGb ?? 8} GB`
-    case 'database': return `${c.vcpu ?? 4} vCPU · ${c.ramGb ?? 16} GB · pool ${c.poolSize ?? 20}${(c.replicas ?? 0) > 0 ? ` · ${c.replicas} replica${c.replicas === 1 ? '' : 's'}` : ''}${(c.pooler ?? 0) >= 0.5 ? ' · proxy' : ''}`
+    case 'database': return `${dbShards(c) > 1 ? `${dbShards(c)} × ` : ''}${c.vcpu ?? 4} vCPU · ${c.ramGb ?? 16} GB · pool ${c.poolSize ?? 20}${(c.replicas ?? 0) > 0 ? ` · ${c.replicas} replica${c.replicas === 1 ? '' : 's'}` : ''}${(c.pooler ?? 0) >= 0.5 ? ' · proxy' : ''}`
     case 'cache': return `${Math.round((c.hitRate ?? 0.8) * 100)}% hit rate`
-    case 'queue': return `drain ${c.capacity ?? 400}/s`
+    case 'queue': return isBroker(c) ? `${Math.round(c.partitions ?? 1)} partitions · ${Math.round(c.consumers ?? 1)} consumer${Math.round(c.consumers ?? 1) === 1 ? '' : 's'}` : `drain ${c.capacity ?? 400}/s`
     case 'cdn': return `${Math.round((c.hitRate ?? 0.9) * 100)}% hit rate`
     case 'bucket': return `${c.storageGb ?? 500} GB · ${c.prefixes ?? 1} prefix${(c.prefixes ?? 1) === 1 ? '' : 'es'}`
     case 'serverless': return `${c.memoryMb ?? 512} MB · up to ${c.concurrency ?? 1000} at once`

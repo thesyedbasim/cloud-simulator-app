@@ -99,6 +99,8 @@ export const CONFIG_SCHEMA: Record<ComponentKind, ConfigField[]> = {
     { key: 'ramGb', label: 'Memory', min: 1, max: 256, step: 1, unit: 'GB', group: 'Instance size' },
     { key: 'poolSize', label: 'Connection pool', min: 5, max: 200, step: 5, group: 'Connections' },
     { key: 'pooler', label: 'Connection pooler (proxy)', min: 0, max: 1, step: 1, toggle: true, optional: true, group: 'Connections' },
+    { key: 'shards', label: 'Shards (partitions of the data)', min: 1, max: 16, step: 1, optional: true, group: 'Sharding' },
+    { key: 'hotShare', label: "Hottest shard's share of traffic (0 = even)", min: 0, max: 1, step: 0.05, pct: true, optional: true, group: 'Sharding' },
     { key: 'replicas', label: 'Read replicas', min: 0, max: 5, step: 1, optional: true, group: 'Replicas' },
     { key: 'replLagMs', label: 'Replication lag when idle', min: 10, max: 2000, step: 10, unit: 'ms', optional: true, group: 'Replicas' },
     { key: 'failoverSec', label: 'Failover time (promote a replica)', min: 5, max: 300, step: 5, unit: 's', optional: true, group: 'Replicas' },
@@ -120,6 +122,11 @@ export const CONFIG_SCHEMA: Record<ComponentKind, ConfigField[]> = {
   queue: [
     { key: 'capacity', label: 'Drain rate', min: 50, max: 2000, step: 50, unit: 'msg/s' },
     { key: 'maxDepth', label: 'Max depth', min: 100, max: 10000, step: 100 },
+    { key: 'partitions', label: 'Partitions (0 = plain queue)', min: 0, max: 32, step: 1, optional: true, group: 'Consumer group' },
+    { key: 'consumers', label: 'Consumers (each drains at the rate above)', min: 1, max: 32, step: 1, optional: true, group: 'Consumer group' },
+    { key: 'hotKeyShare', label: "Hottest partition's share (0 = even)", min: 0, max: 1, step: 0.05, pct: true, optional: true, group: 'Consumer group' },
+    { key: 'poisonPct', label: 'Poison messages', min: 0, max: 0.2, step: 0.01, pct: true, optional: true, group: 'Consumer group' },
+    { key: 'dlq', label: 'Dead-letter queue', min: 0, max: 1, step: 1, toggle: true, optional: true, group: 'Consumer group' },
   ],
 }
 
@@ -140,7 +147,8 @@ export const DEFAULT_CONFIG: Record<ComponentKind, Record<string, number>> = {
 export const OPTIONAL_DEFAULTS: Partial<Record<ComponentKind, Record<string, number>>> = {
   gateway: { limitOn: 1, geoMode: 0, geoMask: 0 },
   serverless: { provisioned: 0 },
-  database: { pooler: 0, replicas: 0, replLagMs: 50, failoverSec: 30 },
+  database: { pooler: 0, replicas: 0, replLagMs: 50, failoverSec: 30, shards: 1, hotShare: 0 },
+  queue: { partitions: 0, consumers: 1, hotKeyShare: 0, poisonPct: 0, dlq: 0 },
   client: { region: 0, clientType: 0, payloadKb: 4, readPct: 0.9, weight: 1, retries: 2, backoff: 0, timeoutMs: 0 },
   loadBalancer: { geoMode: 0, geoMask: 0, policy: 0, healthCheck: 1, hcInterval: 5, hcFails: 3, slowStartSec: 0, drainSec: 0 },
   appServers: { autoscale: 0, maxInstances: 8, warmupSec: 20, scaleUpAt: 0.7, geoMode: 0, geoMask: 0, blocking: 0, callTimeoutMs: 0, breaker: 0, breakerErrPct: 0.25, breakerOpenSec: 10 },

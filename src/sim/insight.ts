@@ -1,6 +1,6 @@
 /** Turns raw simulation numbers into a plain-language explanation of what broke and why. Pure. */
 import type { Architecture, ArchComponent } from '../store/types'
-import { appCapacityPerInstance, dbCapacity } from './capacity'
+import { appCapacityPerInstance, dbCapacity, POISON_RETRY_COST } from './capacity'
 import type { NodeResult, StepResult } from './engine'
 
 export interface Insight {
@@ -111,6 +111,12 @@ function why(c: ArchComponent, n: NodeResult): { title: string; reasons: string[
     }
     case 'database': {
       const d = dbCapacity(cfg)
+      if (n.shards && n.shards.hot > n.shards.even * 1.3) {
+        const pct = (x: number) => Math.round(x * 100)
+        reasons.unshift(`The data is split over ${n.shards.count} shards, but the busiest takes ${pct(n.shards.hot)}% of the traffic instead of an even ${pct(n.shards.even)}%. That shard saturates first, so the database as a whole handles only about ${n0(n.capacity)} rps instead of ${n0(n.capacity * (n.shards.hot / n.shards.even))}: adding shards does not help a hot key.`)
+        hint = 'Spread the hot key (add a random suffix, cache it, or split it), or pick a shard key that spreads load evenly.'
+        break
+      }
       if (n.conns && !n.conns.pooled && n.conns.demand > n.conns.max) {
         reasons.push(`Function instances are holding about ${n0(n.conns.demand)} connections, but the database allows only ${n0(n.conns.max)}, so requests without a connection are refused.`)
         hint = 'Turn on the connection pooler so many function instances share a few connections, or raise the connection pool.'
@@ -124,6 +130,20 @@ function why(c: ArchComponent, n: NodeResult): { title: string; reasons: string[
       break
     }
     case 'queue':
+      if (n.broker) {
+        const b = n.broker
+        const pct = (x: number) => Math.round(x * 100)
+        if (b.hot > 1 / b.partitions * 1.3) {
+          reasons.unshift(`One partition takes ${pct(b.hot)}% of the messages (an even spread would be ${pct(1 / b.partitions)}%), and a partition is read by a single consumer, so adding consumers does not help: that partition's backlog keeps growing while the others sit idle.`)
+          hint = 'Choose a partition key that spreads messages evenly, or split the hot key.'
+        } else if (b.idle > 0) {
+          reasons.unshift(`${b.consumers} consumers share ${b.partitions} partitions, so ${b.idle} sit idle: a partition is read by only one consumer in the group.`)
+          hint = 'Add partitions before adding consumers, or raise the rate each consumer can process.'
+        } else if (b.poison > 0 && b.dlqDepth === 0) {
+          reasons.unshift(`${pct(b.poison)}% of messages are poison: each one is retried about ${POISON_RETRY_COST} times, holding up its partition, and the drain rate drops to ${n0(n.capacity)}/s.`)
+          hint = 'Turn on a dead-letter queue so a poison message is parked after one failure instead of blocking the partition.'
+        }
+      }
       reasons.push(`The queue is ${n0(n.queueDepth)} deep (max ${n0(cfg.maxDepth ?? 0)}) because arrivals outpace the ${n0(cfg.capacity ?? 0)} msg/s drain rate.`)
       hint = 'Raise the drain rate or the maximum depth.'
       break

@@ -5,8 +5,8 @@ import { runSuite } from '../sim/headless'
 import { suggestFixes } from '../sim/fixes'
 
 describe('starter presets', () => {
-  it('has the four starters from the spec', () => {
-    expect(PRESETS.map((p) => p.name)).toEqual(['Link Shortener', 'Chat App', 'Video Streaming', 'E-commerce Store'])
+  it('has the four starters from the spec, then the data-tier ones', () => {
+    expect(PRESETS.map((p) => p.name)).toEqual(['Link Shortener', 'Chat App', 'Video Streaming', 'E-commerce Store', 'Social Feed', 'Event Pipeline'])
   })
   for (const p of PRESETS) {
     describe(p.name, () => {

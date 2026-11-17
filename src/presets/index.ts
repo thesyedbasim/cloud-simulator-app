@@ -57,6 +57,40 @@ const ecommerce: Architecture = {
   ],
 }
 
+/** Social feed: user data is split over shards. Weak point: one celebrity's data is a hot key, so one shard takes half of all traffic. */
+const socialFeed: Architecture = {
+  name: 'Social Feed',
+  components: [
+    { id: 'client', kind: 'client', name: 'Readers', position: { col: 0, row: 3 }, config: { rps: 400 }, assumed: ['rps'] },
+    { id: 'lb', kind: 'loadBalancer', name: 'Load Balancer', position: { col: 3, row: 3 }, config: { targets: 2 } },
+    { id: 'api', kind: 'appServers', name: 'Feed API', position: { col: 6, row: 3 }, config: { instances: 3, vcpu: 4, ramGb: 8 }, assumed: ['vcpu', 'ramGb'] },
+    { id: 'db', kind: 'database', name: 'Post Store', position: { col: 9, row: 3 }, config: { vcpu: 4, ramGb: 16, poolSize: 20, shards: 4, hotShare: 0.5 }, assumed: ['vcpu', 'ramGb', 'poolSize'] },
+  ],
+  connections: [
+    { id: 'c1', from: 'client', to: 'lb' },
+    { id: 'c2', from: 'lb', to: 'api' },
+    { id: 'c3', from: 'api', to: 'db' },
+  ],
+}
+
+/** Event pipeline: a partitioned broker with a consumer group. Weak point: a hot key backs up one partition, and one consumer cannot keep up with it. */
+const eventPipeline: Architecture = {
+  name: 'Event Pipeline',
+  components: [
+    { id: 'client', kind: 'client', name: 'Producers', position: { col: 0, row: 2 }, config: { rps: 250 }, assumed: ['rps'] },
+    { id: 'ingest', kind: 'appServers', name: 'Ingest API', position: { col: 3, row: 2 }, config: { instances: 2, vcpu: 4, ramGb: 8 }, assumed: ['vcpu', 'ramGb'] },
+    { id: 'broker', kind: 'queue', name: 'Event Broker', position: { col: 6, row: 2 }, config: { capacity: 200, maxDepth: 2000, partitions: 4, consumers: 3, hotKeyShare: 0.35 }, assumed: ['capacity', 'maxDepth'] },
+    { id: 'consumers', kind: 'appServers', name: 'Consumers', position: { col: 9, row: 2 }, config: { instances: 2, vcpu: 4, ramGb: 8 }, assumed: ['vcpu', 'ramGb'] },
+    { id: 'db', kind: 'database', name: 'Event Store', position: { col: 12, row: 5 }, config: { vcpu: 16, ramGb: 64, poolSize: 40 }, assumed: ['vcpu', 'ramGb', 'poolSize'] },
+  ],
+  connections: [
+    { id: 'c1', from: 'client', to: 'ingest' },
+    { id: 'c2', from: 'ingest', to: 'broker' },
+    { id: 'c3', from: 'broker', to: 'consumers' },
+    { id: 'c4', from: 'consumers', to: 'db' },
+  ],
+}
+
 export interface Preset { id: string; name: string; blurb: string; weak: string; arch: Architecture }
 
 export const PRESETS: Preset[] = [
@@ -64,6 +98,8 @@ export const PRESETS: Preset[] = [
   { id: 'chat', name: 'Chat App', blurb: 'A queue decouples messages from storage.', weak: 'The queue drains slower than a spike arrives.', arch: chatApp },
   { id: 'video', name: 'Video Streaming', blurb: 'A CDN cache absorbs most plays.', weak: 'A small origin struggles when the cache misses.', arch: videoStreaming },
   { id: 'shop', name: 'E-commerce Store', blurb: 'A busy web tier over an order database.', weak: 'A low cache hit rate pushes reads onto the database.', arch: ecommerce },
+  { id: 'feed', name: 'Social Feed', blurb: 'User data split over four shards.', weak: 'A hot key sends half of all traffic to one shard.', arch: socialFeed },
+  { id: 'events', name: 'Event Pipeline', blurb: 'A partitioned broker with a consumer group.', weak: 'A hot key backs up one partition; extra consumers cannot help.', arch: eventPipeline },
 ]
 
 export const BLANK: Architecture = { name: 'Untitled design', components: [], connections: [] }

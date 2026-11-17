@@ -505,7 +505,7 @@ export class ComponentView extends Container {
       case 'client': return `${Math.round(n.offered)} RPS · ${REGIONS[regionOf(this.comp)].short}`
       case 'cache':
       case 'cdn': return n.offered > 0 ? `HIT ${Math.round(n.hit * 100)}%` : 'IDLE'
-      case 'queue': return `DEPTH ${Math.round(n.queueDepth)}`
+      case 'queue': return `DEPTH ${Math.round(n.queueDepth)}${n.broker ? ` · ${n.broker.active}/${n.broker.partitions}P` : ''}`
       default: {
         if (n.down) return 'DOWN'
         const pct = `${Math.round(n.util * 100)}%`
@@ -513,7 +513,7 @@ export class ComponentView extends Container {
         if (n.injected === 'slow') return `SLOW ${pct}`
         if (n.injected === 'lostInstance') return `-1 NODE ${pct}`
         const blocked = n.blocked >= 0.5 ? ` · ${Math.round(n.blocked)} BLOCKED` : geoModeOf(this.comp) !== GEO_OFF ? ' · GEO' : ''
-        const replicasTxt = this.comp.kind === 'database' && (configValue('database', this.comp.config, 'replicas') ?? 0) > 0 ? ` · +${Math.round(configValue('database', this.comp.config, 'replicas') ?? 0)}R` : ''
+        const replicasTxt = this.comp.kind === 'database' ? `${(configValue('database', this.comp.config, 'shards') ?? 1) > 1 ? ` · ×${Math.round(configValue('database', this.comp.config, 'shards') ?? 1)}S` : ''}${(configValue('database', this.comp.config, 'replicas') ?? 0) > 0 ? ` · +${Math.round(configValue('database', this.comp.config, 'replicas') ?? 0)}R` : ''}` : ''
         const coldTxt = this.comp.kind === 'serverless' && (n.cold ?? 0) > 0.01 ? ` · COLD ${Math.round((n.cold ?? 0) * 100)}%` : ''
         const limiting = this.comp.kind === 'gateway' && n.dropped >= 1 ? ' · LIMITING' : ''
         return (n.offered > 0 ? pct : 'IDLE') + replicasTxt + limiting + coldTxt + blocked

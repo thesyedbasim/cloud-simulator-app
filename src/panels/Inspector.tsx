@@ -62,6 +62,10 @@ function Live({ id }: { id: string }) {
       {n.scaling && n.scaling.pending > 0 && row('Starting', `+${n.scaling.pending}, ready in ${Math.ceil(n.scaling.nextReadyIn ?? 0)} s`)}
       {kind === 'queue' && row('Depth', `${Math.round(n.queueDepth)}`)}
       {kind === 'database' && n.conns && n.conns.demand >= 1 && row(n.conns.pooled ? 'Function connections (shared)' : 'Function connections', `${Math.round(n.conns.demand)}${n.conns.pooled ? '' : ` of ${n.conns.max}`}`, !n.conns.pooled && n.conns.demand > n.conns.max)}
+      {kind === 'database' && n.shards && row('Busiest shard', `${Math.round(n.shards.hot * 100)}% of traffic (${n.shards.count} shards)`, n.shards.hot > n.shards.even * 1.3)}
+      {kind === 'queue' && n.broker && row('Partitions in use', `${n.broker.active} of ${n.broker.partitions} · ${n.broker.consumers} consumers`, n.broker.idle > 0)}
+      {kind === 'queue' && n.broker && n.broker.hot > 1 / n.broker.partitions * 1.3 && row('Hottest partition', `${Math.round(n.broker.hot * 100)}% of messages`, true)}
+      {kind === 'queue' && n.broker && n.broker.dlqDepth >= 1 && row('Dead-lettered', `${Math.round(n.broker.dlqDepth)} messages`, true)}
       {kind === 'database' && n.lagMs !== undefined && row('Replication lag', `${n.lagMs < 1000 ? Math.round(n.lagMs) : (n.lagMs / 1000).toFixed(1) + 's'}`, n.lagMs > 500)}
       {kind === 'database' && n.staleReads !== undefined && row('Reads that may be stale', `${(n.staleReads * 100).toFixed(1)}%`, n.staleReads > 0.1)}
       {kind === 'database' && n.failover && row(n.failover.phase === 'failing' ? 'Failover' : 'Promoted replica', n.failover.phase === 'failing' ? `writes fail, ${Math.ceil(n.failover.remainingSec)} s left` : `${Math.round(n.failover.lostWrites)} writes/s lost`, true)}

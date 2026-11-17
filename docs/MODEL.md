@@ -130,3 +130,15 @@ Scenarios are listed in the Scenarios menu and the compare view. Six were added.
 New faults: `zoneLoss` (a lone instance is down; otherwise `floor(n/2)` of `n` instances remain, and an autoscaler counts the lost ones as dead), `bad` (served × 0.7; the 30 % is an assumed figure). A scenario can now have an `until` time at which its faults are lifted, which is what makes a brief failure possible. The Faults panel has matching buttons (Flush, Lose a zone, Bad release).
 
 **Not modelled yet:** a canary or staged rollout (a bad release always reaches the whole tier), DNS/TTL lag, a slow memory leak (gradual degradation).
+
+## Sharding and partitioned brokers (Stage 5)
+
+**Sharded database.** A database has `shards` (default 1). Each shard is a full database (its own vCPUs, memory and pool, and its own replicas), so cost multiplies by the shard count. Traffic is split by key: evenly, each shard gets `1 / shards`; with `hotShare` set, the busiest shard gets that share instead (never below an even spread). The busiest shard saturates first, so capacity is `per-shard capacity / busiest share`: four even shards give 4×, but a shard taking 50 % of the traffic caps four shards at 2×, and adding more shards changes nothing. The pool gauge shows the busiest shard's pool. An unsharded database is unchanged.
+
+**Partitioned queue (consumer group).** A queue with `partitions > 0` acts like a broker. `capacity` becomes the rate each consumer can drain. A partition is read by one consumer in the group, so `active = min(consumers, partitions)` and the extra consumers sit idle. Drain is `min(active × rate, rate / hottest partition's share)`: the busiest partition has a single reader and caps the whole group. Poison messages (`poisonPct`) without a dead-letter queue are retried about 20 times, holding up their partition: drain ÷ `(1 + poison × 20)`. With a dead-letter queue a poison message is parked after one failure: drain ÷ `(1 + poison)`, and the parked count is shown. Consumers and partitions cost money. A queue with 0 partitions is the plain queue as before.
+
+**Hot key.** The `hotKey` fault sends 60 % (assumed) of a sharded database's or partitioned queue's traffic to one shard or partition. It does nothing to an unsharded database or a plain queue. The **Hot partition** scenario injects it on every sharded database and partitioned queue.
+
+**Presets.** *Social Feed* (four shards, one taking half the traffic) and *Event Pipeline* (four partitions, three consumers, one hot partition).
+
+**Not modelled:** resharding cost and downtime, cross-shard queries, per-partition backlog (the queue depth is the total), ordering guarantees, consumer rebalancing pauses.

@@ -3,7 +3,7 @@
  * Model is documented in docs/MODEL.md. Everything here is deliberately small and approximate.
  */
 import type { ArchComponent, Architecture, ComponentKind } from '../store/types'
-import { appCapacityPerInstance, dbCapacity, FUNCTION_COLD_START_MS, functionCapacity, functionDurationMs, hourlyCost } from './capacity'
+import { appCapacityPerInstance, brokerShape, dbCapacity, dbHotShare, dbShards, FUNCTION_COLD_START_MS, functionCapacity, functionDurationMs, hourlyCost, isBroker, queueDrain } from './capacity'
 import { configValue } from '../store/types'
 import { advanceEdge, backupsInUse, connValue, freshEdgeLb, HASH_BUCKETS, lbSettings, ramp, split, statusOf, type EdgeLb, type Target, type TargetStatus } from './balance'
 import { BLOCK_COST, canGeoBlock, geoAllows, loadUnit, regionOf } from './geo'
@@ -11,8 +11,8 @@ import { shareSlowerThan } from './latency'
 
 export type Health = 'healthy' | 'strained' | 'failed'
 export type TrafficShape = 'steady' | 'spike' | 'daily' | 'flash' | 'ramp'
-/** killed = down; slow = 4× latency and ¼ capacity; lostInstance = one instance of a scaled-out tier dies (a lone instance = down); flushed = a cache or CDN loses everything it held and starts cold; zoneLoss = a failure zone is lost (half the instances of a scaled-out tier, rounded up; a lone instance = down); bad = a bad release (capacity is fine but a share of requests error out). */
-export type Injected = 'killed' | 'slow' | 'lostInstance' | 'flushed' | 'zoneLoss' | 'bad'
+/** killed = down; slow = 4× latency and ¼ capacity; lostInstance = one instance of a scaled-out tier dies (a lone instance = down); flushed = a cache or CDN loses everything it held and starts cold; zoneLoss = a failure zone is lost (half the instances of a scaled-out tier, rounded up; a lone instance = down); bad = a bad release (capacity is fine but a share of requests error out); hotKey = one key dominates, so most of a sharded database's or partitioned queue's traffic lands on a single shard or partition. */
+export type Injected = 'killed' | 'slow' | 'lostInstance' | 'flushed' | 'zoneLoss' | 'bad' | 'hotKey'
 
 export const SHAPES: { id: TrafficShape; label: string }[] = [
   { id: 'steady', label: 'Steady' },
@@ -77,6 +77,8 @@ export interface SimState {
   /** Databases with replicas: sim time the primary was first seen down, and the replication lag (ms) last step. */
   killedAt: Record<string, number>
   lag: Record<string, number>
+  /** Partitioned queues with a dead-letter queue: messages parked there so far. */
+  dlq: Record<string, number>
   /** Writes the old primary had acknowledged but not yet replicated when it died, per second of traffic (lost for good). */
   lost: Record<string, number>
   /** Caches and CDNs: how full they are (1 = at their normal hit rate), and when a flush was first seen. */
@@ -86,7 +88,7 @@ export interface SimState {
   breaker: Record<string, { state: BreakerState; since: number }>
 }
 export type BreakerState = 'closed' | 'open' | 'half'
-export const freshState = (): SimState => ({ t: 0, retryFactor: 0, queueDepth: {}, scale: {}, blockedFrac: {}, lb: {}, warm: {}, hold: {}, callFail: {}, killedAt: {}, lag: {}, lost: {}, warmth: {}, flushedAt: {}, breaker: {} })
+export const freshState = (): SimState => ({ t: 0, retryFactor: 0, queueDepth: {}, scale: {}, blockedFrac: {}, lb: {}, warm: {}, hold: {}, callFail: {}, killedAt: {}, lag: {}, dlq: {}, lost: {}, warmth: {}, flushedAt: {}, breaker: {} })
 
 /** Scale in only after this long without a change, and only if the smaller tier would still be comfortably loaded. */
 const SCALE_IN_COOLDOWN_S = 30
@@ -118,6 +120,10 @@ export interface NodeResult {
   hold?: number
   /** Share of this tier's downstream calls that hit its call timeout. */
   callTimeouts?: number
+  /** Sharded databases: shard count, the busiest shard's share of traffic, and what an even spread would give it. */
+  shards?: { count: number; hot: number; even: number }
+  /** Partitioned queues: partitions, consumers doing work, consumers with nothing to read, the busiest partition's share, and dead-lettered messages. */
+  broker?: { partitions: number; consumers: number; active: number; idle: number; hot: number; dlqDepth: number; poison: number }
   /** Caches and CDNs: share of the normal hit rate they are delivering (0 right after a flush), and how much their misses are multiplied by a stampede. */
   warmth?: number
   stampede?: number
@@ -153,19 +159,19 @@ function capacityOf(c: ArchComponent, instances: number, inj: Injected | undefin
     case 'client': capacity = Infinity; break
     case 'loadBalancer': capacity = (cfg.targets ?? 2) * 5000; break
     case 'appServers': capacity = (instances * appCapacityPerInstance(cfg).rps) / hold; break // workers stuck on a slow dependency serve fewer requests
-    case 'database': capacity = Math.min(dbCapacity(cfg).rps, (cfg.poolSize ?? 20) / (baseLat / 1000)); break
+    case 'database': capacity = Math.min(dbCapacity(cfg).rps, (cfg.poolSize ?? 20) / (baseLat / 1000)) / dbHotShare(cfg, inj === 'hotKey'); break // each shard has this capacity, and the busiest one runs out first
     case 'cache': capacity = 20000; break
     case 'serverless': capacity = functionCapacity(cfg); break
     case 'cdn': capacity = 50000; break
     case 'bucket': capacity = (cfg.prefixes ?? 1) * 5500; break // roughly what object storage allows per key prefix
     case 'gateway': capacity = (configValue('gateway', cfg, 'limitOn') ?? 1) >= 0.5 ? (cfg.rateLimit ?? 2000) : 20000; break
-    case 'queue': capacity = cfg.capacity ?? 400; break
+    case 'queue': capacity = queueDrain(cfg, inj === 'hotKey'); break
   }
   if (inj === 'killed') capacity = 0
   else if (inj === 'lostInstance') capacity = c.kind === 'appServers' && instances > 1 ? (capacity * (instances - 1)) / instances : 0
   else if (inj === 'zoneLoss') capacity = c.kind === 'appServers' && instances > 1 ? (capacity * Math.floor(instances / 2)) / instances : 0 // the larger zone is the one that fails
   else if (inj === 'slow' && c.kind !== 'database') capacity /= SLOW_FACTOR
-  else if (inj === 'slow') capacity = Math.min(capacity, dbCapacity(cfg).rps / SLOW_FACTOR)
+  else if (inj === 'slow') capacity = Math.min(capacity, dbCapacity(cfg).rps / SLOW_FACTOR / dbHotShare(cfg, false))
   return capacity
 }
 
@@ -216,6 +222,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   const nextLb: Record<string, EdgeLb> = {}
   const nextWarm: Record<string, number> = {}
   const nextKilledAt: Record<string, number> = {}
+  const nextDlq: Record<string, number> = {}
   const nextBreaker: SimState['breaker'] = {}
   const nextWarmth: Record<string, number> = {}
   const nextFlushedAt: Record<string, number> = {}
@@ -314,7 +321,9 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
 
     const baseLat = BASE_LATENCY_MS[c.kind] * slow
     let poolUsed = 0
-    const poolSize = c.kind === 'database' ? (cfg.poolSize ?? 20) : 0
+    const shardN = c.kind === 'database' ? dbShards(cEff.config) : 1
+    const hotShare = c.kind === 'database' ? dbHotShare(cEff.config, inj === 'hotKey') : 1
+    const poolSize = c.kind === 'database' ? (cfg.poolSize ?? 20) : 0 // per shard
     const hold = waitsOnDownstream(c) ? (prev.hold?.[id] ?? 1) : 1
     const callFail = waitsOnDownstream(c) ? (prev.callFail?.[id] ?? 0) : 0
     let capacity = capacityOf(cEff, instances, inj, hold)
@@ -331,14 +340,15 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
         if (e.to === id && byId.get(e.from)?.kind === 'serverless' && u && u.served > 0) demand += (u.concurrency ?? 0) * ((edgeRes[e.id]?.rps ?? 0) / u.served)
       }
       const pooled = (configValue('database', cfg, 'pooler') ?? 0) >= 0.5
-      conns = { demand, max: poolSize, pooled }
-      if (!pooled && demand > poolSize) capacity = Math.min(capacity, offered * (poolSize / demand))
+      conns = { demand, max: poolSize * shardN, pooled }
+      if (!pooled && demand > poolSize * shardN) capacity = Math.min(capacity, offered * ((poolSize * shardN) / demand))
     }
 
     const util = capacity === Infinity ? 0 : capacity === 0 ? (offered > 0 ? 2 : 0) : (failing ? offered * readShare : unitLoad + blockLoad) / capacity
     let served: number
     let dropped: number
     let depth = 0
+    let broker: NodeResult['broker']
     if (c.kind === 'queue') {
       const maxDepth = cfg.maxDepth ?? 2000
       const prevDepth = prev.queueDepth[id] ?? 0
@@ -349,6 +359,13 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       dropped = Math.min(offered, overflow)
       served = Math.max(0, offered - dropped - (dt > 0 ? (d - prevDepth) / dt : 0))
       nextQueue[id] = d
+      if (isBroker(cfg)) {
+        const b = brokerShape(cfg, inj === 'hotKey')
+        const poison = cfg.poisonPct ?? 0
+        const parked = (cfg.dlq ?? 0) >= 0.5 ? (prev.dlq?.[id] ?? 0) + offered * poison * Math.max(0, dt) : 0
+        if (parked > 0) nextDlq[id] = parked
+        broker = { partitions: b.partitions, consumers: b.consumers, active: b.active, idle: b.idle, hot: b.hot, dlqDepth: parked, poison }
+      }
     } else {
       served = (failing ? Math.min(offered * readShare, capacity) : Math.min(offered, Math.max(0, capacity - blockLoad) / unit)) * (1 - callFail) * (inj === 'bad' ? 1 - BAD_RELEASE_RATE : 1) // calls that timed out, or hit a bad release, are failures here
       dropped = offered - served
@@ -392,8 +409,8 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
         nextLost[id] = (offered - readRps) * ((prev.lag?.[id] ?? 0) / 1000)
         failover.lostWrites = nextLost[id]
       } else if (failover) nextLost[id] = prev.lost?.[id] ?? 0
-      poolUsed = Math.min(poolSize, served * (latency / 1000))
-      if (conns && !conns.pooled) poolUsed = Math.min(poolSize, Math.max(poolUsed, conns.demand)) // idle connections held by functions still count
+      poolUsed = Math.min(poolSize, served * hotShare * (latency / 1000)) // the pool shown is the busiest shard's
+      if (conns && !conns.pooled) poolUsed = Math.min(poolSize, Math.max(poolUsed, conns.demand / shardN)) // idle connections held by functions still count
       if (conns?.pooled && conns.demand > 0) latency += 2 // waiting for a pooled connection
     }
 
@@ -482,7 +499,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       if ((inj && capacity === 0) || (!limiting && (util >= 1 || (offered > 0 && dropped > 0.01 * offered)))) health = 'failed'
       else if (util >= 0.7 || (limiting && dropped > 0.01 * offered)) health = 'strained'
     }
-    nodes[id] = { offered, served, dropped, util, latency, queueDepth: depth, health, poolUsed, poolSize, hit, injected: injRaw, down: !!inj && capacity === 0, capacity, lagMs, staleReads, failover, blocked, cold, concurrency, conns, scaling, warmth, stampede, breaker: breakerState, ...(hold > 1.01 ? { hold } : {}), ...(callFail > 0.001 ? { callTimeouts: callFail } : {}) }
+    nodes[id] = { offered, served, dropped, util, latency, queueDepth: depth, health, poolUsed, poolSize, hit, injected: injRaw, down: !!inj && capacity === 0, capacity, lagMs, staleReads, failover, blocked, cold, concurrency, conns, scaling, shards: c.kind === 'database' && shardN > 1 ? { count: shardN, hot: hotShare, even: 1 / shardN } : undefined, broker, warmth, stampede, breaker: breakerState, ...(hold > 1.01 ? { hold } : {}), ...(callFail > 0.001 ? { callTimeouts: callFail } : {}) }
   }
 
   for (const e of edges) {
@@ -600,7 +617,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   const retryFactor = dt > 0 ? prev.retryFactor + (targetRetry - prev.retryFactor) * smoothing : prev.retryFactor
 
   return {
-    state: { t, retryFactor, queueDepth: nextQueue, scale: nextScale, blockedFrac, lb: nextLb, warm: nextWarm, hold: nextHold, callFail: nextCallFail, killedAt: nextKilledAt, lag: nextLag, lost: nextLost, warmth: nextWarmth, flushedAt: nextFlushedAt, breaker: nextBreaker },
+    state: { t, retryFactor, queueDepth: nextQueue, scale: nextScale, blockedFrac, lb: nextLb, warm: nextWarm, hold: nextHold, callFail: nextCallFail, killedAt: nextKilledAt, lag: nextLag, dlq: nextDlq, lost: nextLost, warmth: nextWarmth, flushedAt: nextFlushedAt, breaker: nextBreaker },
     result: { nodes, edges: edgeRes, totals: { p50: Math.min(p50, 30000), p99: Math.min(p99, 30000), errorRate, throughput: completed * (1 - timeouts), offered: clientOffered, cost, retryFactor, blocked: blockedTotal, timeouts } },
   }
 }
