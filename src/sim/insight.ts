@@ -51,6 +51,10 @@ function why(c: ArchComponent, n: NodeResult): { title: string; reasons: string[
       const per = appCapacityPerInstance(cfg)
       reasons.push(`Each instance (${cfg.vcpu} vCPU, ${cfg.ramGb} GB) serves about ${n0(per.rps)} rps, limited by ${per.limiter === 'CPU' ? 'CPU' : 'memory'}.`)
       hint = per.limiter === 'RAM' ? 'Memory is the limit: adding vCPUs alone will not help. Add RAM or more instances.' : 'Add vCPUs (scale up) or more instances (scale out).'
+      if (n.hold) {
+        reasons.unshift(`Workers here wait on slower downstream services, so each one is held about ${n.hold.toFixed(1)}× longer than normal and the tier handles ${Math.round((1 - 1 / n.hold) * 100)}% fewer requests. The real problem is downstream: this tier is only the first to feel it.`)
+        hint = n.callTimeouts ? 'Call timeouts are already failing the slowest calls. Fix the slow dependency, or add a circuit breaker.' : 'Fix the slow dependency, or set a call timeout so workers give up instead of waiting forever.'
+      }
       const sc = n.scaling
       if (sc) {
         if (sc.pending > 0) {
@@ -104,6 +108,7 @@ export function analyze(arch: Architecture, res: StepResult): Insight | null {
   const w = why(worst.c, worst.n)
   const reasons = [...w.reasons]
   const retry = res.totals.retryFactor
+  if (res.totals.timeouts > 0.05) reasons.push(`${Math.round(res.totals.timeouts * 100)}% of requests run past the client timeout and count as failures.`)
   if (retry > 0.15) reasons.push(`Clients are retrying failed requests, adding about ${Math.round(retry * 100)}% more load. This retry storm keeps the problem going.`)
   return { key: `${worst.c.id}:${w.kind}`, nodeId: worst.c.id, title: w.title, reasons, hint: w.hint }
 }

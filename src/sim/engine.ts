@@ -7,6 +7,7 @@ import { appCapacityPerInstance, dbCapacity, FUNCTION_COLD_START_MS, functionCap
 import { configValue } from '../store/types'
 import { advanceEdge, backupsInUse, connValue, freshEdgeLb, HASH_BUCKETS, lbSettings, ramp, split, statusOf, type EdgeLb, type Target, type TargetStatus } from './balance'
 import { BLOCK_COST, canGeoBlock, geoAllows, loadUnit, regionOf } from './geo'
+import { shareSlowerThan } from './latency'
 
 export type Health = 'healthy' | 'strained' | 'failed'
 export type TrafficShape = 'steady' | 'spike' | 'daily' | 'flash' | 'ramp'
@@ -37,7 +38,13 @@ export function trafficMultiplier(shape: TrafficShape, t: number): number {
 }
 
 const BASE_LATENCY_MS: Record<ComponentKind, number> = { client: 0, gateway: 6, loadBalancer: 2, appServers: 25, serverless: 100, database: 18, cache: 1, cdn: 8, queue: 4, bucket: 35 }
-const RETRIES = 2 // extra attempts a failed request makes
+const RETRIES = 2 // extra attempts a failed request makes, unless a client says otherwise
+/** Exponential backoff with jitter spreads retries out, so far fewer land while the system is still struggling. */
+const BACKOFF_DAMPING = 0.4
+/** A blocked worker is held at most this many times longer than normal. */
+const MAX_HOLD = 20
+/** Ordinary queueing downstream (latency up to 15% over its idle value) is normal and does not hold workers longer. */
+const HOLD_GRACE = 1.15
 const SLOW_FACTOR = 4
 
 /** Autoscaling bookkeeping for one app tier. */
@@ -61,8 +68,12 @@ export interface SimState {
   lb: Record<string, EdgeLb>
   /** Warm function instances (concurrent executions kept ready) per serverless node. */
   warm: Record<string, number>
+  /** App tiers that wait on downstream calls: how many times longer each worker is held than normal (1 = no effect). */
+  hold: Record<string, number>
+  /** App tiers with a call timeout: share of downstream calls that timed out last step. */
+  callFail: Record<string, number>
 }
-export const freshState = (): SimState => ({ t: 0, retryFactor: 0, queueDepth: {}, scale: {}, blockedFrac: {}, lb: {}, warm: {} })
+export const freshState = (): SimState => ({ t: 0, retryFactor: 0, queueDepth: {}, scale: {}, blockedFrac: {}, lb: {}, warm: {}, hold: {}, callFail: {} })
 
 /** Scale in only after this long without a change, and only if the smaller tier would still be comfortably loaded. */
 const SCALE_IN_COOLDOWN_S = 30
@@ -90,6 +101,10 @@ export interface NodeResult {
   concurrency?: number
   /** Databases only: connections that function instances want, the limit, and whether a pooler shares them. */
   conns?: { demand: number; max: number; pooled: boolean }
+  /** App tiers that wait on downstream calls: how many times longer than normal each worker is held (1 = unaffected). */
+  hold?: number
+  /** Share of this tier's downstream calls that hit its call timeout. */
+  callTimeouts?: number
   /** Present for autoscaled app tiers. */
   scaling?: { active: number; pending: number; min: number; max: number; warmupSec: number; nextReadyIn: number | null }
 }
@@ -100,18 +115,21 @@ export interface EdgeResult {
   lb?: { status: TargetStatus; share: number; bySource: Record<string, number> }
 }
 /** `blocked` is traffic turned away by geo rules. It is left out of the error rate and the error budget. */
-export interface Totals { p50: number; p99: number; errorRate: number; throughput: number; offered: number; cost: number; retryFactor: number; blocked: number }
+export interface Totals { p50: number; p99: number; errorRate: number; throughput: number; offered: number; cost: number; retryFactor: number; blocked: number
+  /** Share of requests that ran past their client's timeout. Already included in `errorRate`. */
+  timeouts: number
+}
 export interface StepResult { nodes: Record<string, NodeResult>; edges: Record<string, EdgeResult>; totals: Totals }
 
 /** Capacity in rps of a component right now, with any injected fault applied. Shared by the node maths and the balancer's estimate. */
-function capacityOf(c: ArchComponent, instances: number, inj: Injected | undefined): number {
+function capacityOf(c: ArchComponent, instances: number, inj: Injected | undefined, hold = 1): number {
   const cfg = c.config
   const baseLat = BASE_LATENCY_MS[c.kind] * (inj === 'slow' ? SLOW_FACTOR : 1)
   let capacity: number
   switch (c.kind) {
     case 'client': capacity = Infinity; break
     case 'loadBalancer': capacity = (cfg.targets ?? 2) * 5000; break
-    case 'appServers': capacity = instances * appCapacityPerInstance(cfg).rps; break
+    case 'appServers': capacity = (instances * appCapacityPerInstance(cfg).rps) / hold; break // workers stuck on a slow dependency serve fewer requests
     case 'database': capacity = Math.min(dbCapacity(cfg).rps, (cfg.poolSize ?? 20) / (baseLat / 1000)); break
     case 'cache': capacity = 20000; break
     case 'serverless': capacity = functionCapacity(cfg); break
@@ -126,6 +144,9 @@ function capacityOf(c: ArchComponent, instances: number, inj: Injected | undefin
   else if (inj === 'slow') capacity = Math.min(capacity, dbCapacity(cfg).rps / SLOW_FACTOR)
   return capacity
 }
+
+/** Does this app tier keep a worker busy while its downstream calls are in flight? */
+const waitsOnDownstream = (c: ArchComponent) => c.kind === 'appServers' && (configValue('appServers', c.config, 'blocking') ?? 0) >= 0.5
 
 export function step(arch: Architecture, prev: SimState, dt: number, opts: { shape: TrafficShape; injected?: Record<string, Injected> }): { state: SimState; result: StepResult } {
   const t = prev.t + dt
@@ -234,7 +255,9 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
     const baseLat = BASE_LATENCY_MS[c.kind] * slow
     let poolUsed = 0
     const poolSize = c.kind === 'database' ? (cfg.poolSize ?? 20) : 0
-    let capacity = capacityOf(c, instances, inj)
+    const hold = waitsOnDownstream(c) ? (prev.hold?.[id] ?? 1) : 1
+    const callFail = waitsOnDownstream(c) ? (prev.callFail?.[id] ?? 0) : 0
+    let capacity = capacityOf(c, instances, inj, hold)
 
     // Function instances each hold a database connection while they run. Without a pooler, more of them than the
     // database allows means the extra requests are refused; a pooler shares a few connections between them all.
@@ -265,7 +288,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       served = Math.max(0, offered - dropped - (dt > 0 ? (d - prevDepth) / dt : 0))
       nextQueue[id] = d
     } else {
-      served = Math.min(offered, Math.max(0, capacity - blockLoad) / unit)
+      served = Math.min(offered, Math.max(0, capacity - blockLoad) / unit) * (1 - callFail) // calls that timed out are failures here
       dropped = offered - served
     }
 
@@ -321,7 +344,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
           const tc = byId.get(e.to)!
           const tInj = opts.injected?.[e.to]
           const tInst = tc.kind === 'appServers' && (configValue('appServers', tc.config, 'autoscale') ?? 0) >= 0.5 ? (prev.scale[tc.id]?.active ?? tc.config.instances ?? 1) : (tc.config.instances ?? 1)
-          const cap = capacityOf(tc, tInst, tInj)
+          const cap = capacityOf(tc, tInst, tInj, waitsOnDownstream(tc) ? (prev.hold?.[tc.id] ?? 1) : 1)
           const drainOn = connValue(e, 'drain') >= 0.5
           const st = advanceEdge(prev.lb[e.id] ?? freshEdgeLb(prev.t), cap === 0, drainOn, t, dt, s)
           nextLb[e.id] = st
@@ -361,12 +384,44 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       if ((inj && capacity === 0) || (!limiting && (util >= 1 || (offered > 0 && dropped > 0.01 * offered)))) health = 'failed'
       else if (util >= 0.7 || (limiting && dropped > 0.01 * offered)) health = 'strained'
     }
-    nodes[id] = { offered, served, dropped, util, latency, queueDepth: depth, health, poolUsed, poolSize, hit, injected: inj, down: !!inj && capacity === 0, capacity, blocked, cold, concurrency, conns, scaling }
+    nodes[id] = { offered, served, dropped, util, latency, queueDepth: depth, health, poolUsed, poolSize, hit, injected: inj, down: !!inj && capacity === 0, capacity, blocked, cold, concurrency, conns, scaling, ...(hold > 1.01 ? { hold } : {}), ...(callFail > 0.001 ? { callTimeouts: callFail } : {}) }
   }
 
   for (const e of edges) {
     const tgt = nodes[e.to]
     if (edgeRes[e.id] && tgt) edgeRes[e.id].dropFrac = tgt.offered > 0 ? tgt.dropped / tgt.offered : 0
+  }
+
+  // Backpressure: a worker that waits on its downstream calls is held for as long as they take. How much longer than
+  // normal is read from this step's latencies and applied next step. A call timeout caps the wait, and the calls
+  // that run past it fail instead.
+  const nextHold: Record<string, number> = {}
+  const nextCallFail: Record<string, number> = {}
+  const downLat: Record<string, number> = {}
+  const downBase: Record<string, number> = {}
+  for (const id of [...order].reverse()) {
+    const n = nodes[id]
+    let d = 0, b = 0
+    if (n.served > 0) for (const e of outs.get(id) ?? []) {
+      const share = (edgeRes[e.id]?.rps ?? 0) / n.served
+      const tc = byId.get(e.to)!
+      d += share * (nodes[e.to].latency + downLat[e.to])
+      b += share * (BASE_LATENCY_MS[tc.kind] + downBase[e.to])
+    }
+    downLat[id] = d
+    downBase[id] = b
+  }
+  for (const c of arch.components) {
+    if (!waitsOnDownstream(c)) continue
+    const timeout = c.config.callTimeoutMs ?? 0
+    const d = downLat[c.id]
+    const waited = timeout > 0 ? Math.min(d, timeout) : d
+    const raw = Math.min(MAX_HOLD, Math.max(1, (BASE_LATENCY_MS.appServers + waited) / (HOLD_GRACE * (BASE_LATENCY_MS.appServers + downBase[c.id]))))
+    const was = prev.hold?.[c.id] ?? 1
+    nextHold[c.id] = dt > 0 ? was + (raw - was) * 0.25 : was
+    const failRaw = timeout > 0 ? shareSlowerThan(d, d * 4, timeout) : 0 // downstream latency is spread around its mean; the slow tail runs out of time
+    const failWas = prev.callFail?.[c.id] ?? 0
+    nextCallFail[c.id] = dt > 0 ? failWas + (failRaw - failWas) * 0.25 : failWas
   }
 
   let clientOffered = 0
@@ -380,7 +435,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   }
   // Blocked requests were turned away on purpose, so they are neither errors nor part of what must succeed.
   const legit = Math.max(0, clientOffered - blockedTotal)
-  const errorRate = legit > 0 ? Math.min(1, dropped / legit) : 0
+  const dropRate = legit > 0 ? Math.min(1, dropped / legit) : 0
   let p50 = 0
   let p99 = 0
   if (legit > 0) {
@@ -392,13 +447,33 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       p99 += w * (n.latency * (2 + 6 * rho * rho) + ((n.cold ?? 0) > 0.01 ? FUNCTION_COLD_START_MS : 0)) // a few cold requests already set the tail
     }
   }
+  // Client timeouts and retry policy. A request slower than its client's timeout counts as failed, whatever the server did.
+  let timeoutShare = 0
+  let retriesSum = 0
+  let backoffShare = 0
+  let weightSum = 0
+  for (const c of arch.components) {
+    if (c.kind !== 'client') continue
+    const w = nodes[c.id].offered
+    if (w <= 0) continue
+    const tms = configValue('client', c.config, 'timeoutMs') ?? 0
+    timeoutShare += w * shareSlowerThan(p50, p99, tms)
+    const backoff = (configValue('client', c.config, 'backoff') ?? 0) >= 0.5
+    retriesSum += w * (configValue('client', c.config, 'retries') ?? RETRIES) * (backoff ? BACKOFF_DAMPING : 1)
+    backoffShare += backoff ? w : 0
+    weightSum += w
+  }
+  const timeouts = weightSum > 0 ? timeoutShare / weightSum : 0
+  const errorRate = Math.min(1, dropRate + (1 - dropRate) * timeouts)
+  const avgRetries = weightSum > 0 ? retriesSum / weightSum : RETRIES
   const blockedFrac: Record<string, number> = {}
   for (const [src, rps] of Object.entries(blockedBySrc)) { const o = nodes[src]?.offered ?? 0; if (o > 0) blockedFrac[src] = Math.min(1, rps / o) }
-  const targetRetry = Math.min(2, errorRate * RETRIES)
-  const retryFactor = dt > 0 ? prev.retryFactor + (targetRetry - prev.retryFactor) * 0.2 : prev.retryFactor
+  const targetRetry = errorRate * avgRetries
+  const smoothing = 0.2 - 0.12 * (weightSum > 0 ? backoffShare / weightSum : 0) // backoff also makes the extra load arrive later
+  const retryFactor = dt > 0 ? prev.retryFactor + (targetRetry - prev.retryFactor) * smoothing : prev.retryFactor
 
   return {
-    state: { t, retryFactor, queueDepth: nextQueue, scale: nextScale, blockedFrac, lb: nextLb, warm: nextWarm },
-    result: { nodes, edges: edgeRes, totals: { p50: Math.min(p50, 30000), p99: Math.min(p99, 30000), errorRate, throughput: completed, offered: clientOffered, cost, retryFactor, blocked: blockedTotal } },
+    state: { t, retryFactor, queueDepth: nextQueue, scale: nextScale, blockedFrac, lb: nextLb, warm: nextWarm, hold: nextHold, callFail: nextCallFail },
+    result: { nodes, edges: edgeRes, totals: { p50: Math.min(p50, 30000), p99: Math.min(p99, 30000), errorRate, throughput: completed * (1 - timeouts), offered: clientOffered, cost, retryFactor, blocked: blockedTotal, timeouts } },
   }
 }

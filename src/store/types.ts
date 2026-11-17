@@ -52,6 +52,9 @@ export const CONFIG_SCHEMA: Record<ComponentKind, ConfigField[]> = {
     { key: 'payloadKb', label: 'Response size', min: 1, max: 1000, step: 1, unit: 'KB', optional: true, group: 'Request mix' },
     { key: 'readPct', label: 'Reads (rest are writes)', min: 0, max: 1, step: 0.05, pct: true, optional: true, group: 'Request mix' },
     { key: 'weight', label: 'Request cost (CPU)', min: 1, max: 5, step: 0.5, unit: '×', optional: true, group: 'Request mix' },
+    { key: 'retries', label: 'Retries per failed request', min: 0, max: 5, step: 1, optional: true, group: 'Retry policy' },
+    { key: 'backoff', label: 'Exponential backoff + jitter', min: 0, max: 1, step: 1, toggle: true, optional: true, group: 'Retry policy' },
+    { key: 'timeoutMs', label: 'Client timeout (0 = none)', min: 0, max: 10000, step: 100, unit: 'ms', optional: true, group: 'Retry policy' },
   ],
   gateway: [
     { key: 'limitOn', label: 'Rate limit', min: 0, max: 1, step: 1, toggle: true, optional: true },
@@ -78,6 +81,8 @@ export const CONFIG_SCHEMA: Record<ComponentKind, ConfigField[]> = {
     { key: 'scaleUpAt', label: 'Scale out above', min: 0.4, max: 0.95, step: 0.05, pct: true, showIf: 'autoscale', optional: true, group: 'Scale' },
     { key: 'vcpu', label: 'vCPUs per instance', min: 1, max: 32, step: 1, group: 'Instance size' },
     { key: 'ramGb', label: 'Memory per instance', min: 1, max: 128, step: 1, unit: 'GB', group: 'Instance size' },
+    { key: 'blocking', label: 'Workers wait on downstream calls', min: 0, max: 1, step: 1, toggle: true, optional: true, group: 'Downstream calls' },
+    { key: 'callTimeoutMs', label: 'Call timeout (0 = wait forever)', min: 0, max: 10000, step: 100, unit: 'ms', showIf: 'blocking', optional: true, group: 'Downstream calls' },
     { key: 'geoMode', label: 'Geo rule', min: 0, max: 2, step: 1, optional: true, hidden: true },
     { key: 'geoMask', label: 'Geo regions', min: 0, max: 63, step: 1, optional: true, hidden: true },
   ],
@@ -123,9 +128,9 @@ export const OPTIONAL_DEFAULTS: Partial<Record<ComponentKind, Record<string, num
   gateway: { limitOn: 1, geoMode: 0, geoMask: 0 },
   serverless: { provisioned: 0 },
   database: { pooler: 0, replicas: 0 },
-  client: { region: 0, clientType: 0, payloadKb: 4, readPct: 0.9, weight: 1 },
+  client: { region: 0, clientType: 0, payloadKb: 4, readPct: 0.9, weight: 1, retries: 2, backoff: 0, timeoutMs: 0 },
   loadBalancer: { geoMode: 0, geoMask: 0, policy: 0, healthCheck: 1, hcInterval: 5, hcFails: 3, slowStartSec: 0, drainSec: 0 },
-  appServers: { autoscale: 0, maxInstances: 8, warmupSec: 20, scaleUpAt: 0.7, geoMode: 0, geoMask: 0 },
+  appServers: { autoscale: 0, maxInstances: 8, warmupSec: 20, scaleUpAt: 0.7, geoMode: 0, geoMask: 0, blocking: 0, callTimeoutMs: 0 },
 }
 
 /** A setting's value, falling back to its default when the component does not carry it. */
