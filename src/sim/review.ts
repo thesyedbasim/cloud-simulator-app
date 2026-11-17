@@ -9,7 +9,7 @@ export interface Spof { id: string; name: string; reason: string }
 /**
  * A component is a single point of failure when every request path from a client to the end of the
  * chain goes through it and it has no redundancy (a scaled-out app tier counts as redundant).
- * Redundancy for the other kinds means a parallel copy, since the model has no replicas.
+ * A database with a read replica is redundant too (it fails over, after a delay). Other kinds need a parallel copy.
  */
 export function findSpofs(arch: Architecture): Spof[] {
   const out = new Map<string, string[]>()
@@ -35,6 +35,7 @@ export function findSpofs(arch: Architecture): Spof[] {
   const spofs: Spof[] = []
   for (const c of arch.components) {
     if (c.kind === 'client' || reachesEnd(c.id)) continue
+    if (c.kind === 'database' && (c.config.replicas ?? 0) > 0) continue // a replica is promoted if the primary dies (after the failover time)
     if (c.kind === 'appServers') {
       const n = c.config.instances ?? 1
       if (n > 1) continue

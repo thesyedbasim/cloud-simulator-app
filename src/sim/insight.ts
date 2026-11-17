@@ -19,6 +19,15 @@ function why(c: ArchComponent, n: NodeResult): { title: string; reasons: string[
   const cfg = c.config
   const dropPct = n.offered > 0 ? Math.round((n.dropped / n.offered) * 100) : 0
 
+  if (n.failover?.phase === 'failing') {
+    const reps = Math.round(cfg.replicas ?? 0)
+    const reasons = [
+      `The primary of ${name} is down and a replica is being promoted, ready in about ${Math.ceil(n.failover.remainingSec)} s. Until then writes fail and ${reps} replica${reps === 1 ? '' : 's'} serve reads only, so ${dropPct}% of requests are dropped.`,
+    ]
+    if (n.failover.lostWrites >= 1) reasons.push(`About ${n0(n.failover.lostWrites)} acknowledged writes had not reached a replica yet when the primary died. They are lost for good.`)
+    return { kind: 'failover', title: `${name} is failing over`, reasons, hint: 'A shorter failover time, or a design that retries writes after the switch, shortens the outage. Lower replication lag loses fewer writes.' }
+  }
+
   if (n.down) {
     const lone = n.injected === 'lostInstance'
     return {

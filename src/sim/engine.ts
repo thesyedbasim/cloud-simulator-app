@@ -72,8 +72,13 @@ export interface SimState {
   hold: Record<string, number>
   /** App tiers with a call timeout: share of downstream calls that timed out last step. */
   callFail: Record<string, number>
+  /** Databases with replicas: sim time the primary was first seen down, and the replication lag (ms) last step. */
+  killedAt: Record<string, number>
+  lag: Record<string, number>
+  /** Writes the old primary had acknowledged but not yet replicated when it died, per second of traffic (lost for good). */
+  lost: Record<string, number>
 }
-export const freshState = (): SimState => ({ t: 0, retryFactor: 0, queueDepth: {}, scale: {}, blockedFrac: {}, lb: {}, warm: {}, hold: {}, callFail: {} })
+export const freshState = (): SimState => ({ t: 0, retryFactor: 0, queueDepth: {}, scale: {}, blockedFrac: {}, lb: {}, warm: {}, hold: {}, callFail: {}, killedAt: {}, lag: {}, lost: {} })
 
 /** Scale in only after this long without a change, and only if the smaller tier would still be comfortably loaded. */
 const SCALE_IN_COOLDOWN_S = 30
@@ -105,6 +110,11 @@ export interface NodeResult {
   hold?: number
   /** Share of this tier's downstream calls that hit its call timeout. */
   callTimeouts?: number
+  /** Databases with replicas: how far behind the primary the replicas are, and the share of reads that may return stale data. */
+  lagMs?: number
+  staleReads?: number
+  /** A primary that is down while a replica is promoted (writes fail, reads survive), or already promoted. */
+  failover?: { phase: 'failing' | 'promoted'; remainingSec: number; lostWrites: number }
   /** Present for autoscaled app tiers. */
   scaling?: { active: number; pending: number; min: number; max: number; warmupSec: number; nextReadyIn: number | null }
 }
@@ -146,6 +156,9 @@ function capacityOf(c: ArchComponent, instances: number, inj: Injected | undefin
 }
 
 /** Does this app tier keep a worker busy while its downstream calls are in flight? */
+/** A read replica is this likely to be behind on a hot row after `lag` ms: 1 − e^(−lag / 2 s). An assumed figure. */
+const STALE_WINDOW_MS = 2000
+
 const waitsOnDownstream = (c: ArchComponent) => c.kind === 'appServers' && (configValue('appServers', c.config, 'blocking') ?? 0) >= 0.5
 
 export function step(arch: Architecture, prev: SimState, dt: number, opts: { shape: TrafficShape; injected?: Record<string, Injected> }): { state: SimState; result: StepResult } {
@@ -181,6 +194,9 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   const nextScale: Record<string, ScaleState> = {}
   const nextLb: Record<string, EdgeLb> = {}
   const nextWarm: Record<string, number> = {}
+  const nextKilledAt: Record<string, number> = {}
+  const nextLag: Record<string, number> = {}
+  const nextLost: Record<string, number> = {}
   const blockedBySrc: Record<string, number> = {}
   const mult = trafficMultiplier(opts.shape, t)
   let completed = 0
@@ -189,7 +205,25 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   for (const id of order) {
     const c = byId.get(id)!
     const cfg = c.config
-    const inj = opts.injected?.[id]
+    const injRaw = opts.injected?.[id]
+    // A dead primary with replicas does not stay dead: after the failover time a replica is promoted. Until then
+    // writes fail and the replicas keep serving reads.
+    let inj = injRaw
+    let cEff: ArchComponent = c
+    let failing = false
+    let failover: NodeResult['failover']
+    if (c.kind === 'database' && injRaw === 'killed') {
+      const reps = Math.round(configValue('database', cfg, 'replicas') ?? 0)
+      if (reps > 0) {
+        const since = prev.killedAt?.[id] ?? t
+        nextKilledAt[id] = since
+        const fsec = configValue('database', cfg, 'failoverSec') ?? 30
+        const remaining = Math.max(0, fsec - (t - since))
+        if (remaining > 0) failing = true
+        else { inj = undefined; cEff = { ...c, config: { ...cfg, replicas: reps - 1 } } }
+        failover = { phase: remaining > 0 ? 'failing' : 'promoted', remainingSec: remaining, lostWrites: prev.lost?.[id] ?? 0 }
+      }
+    }
     const slow = inj === 'slow' ? SLOW_FACTOR : 1
     const arriving: Map<string, number> = c.kind === 'client' ? new Map([[id, (cfg.rps ?? 0) * mult * (1 + prev.retryFactor * (1 - (prev.blockedFrac?.[id] ?? 0)))]]) : (inflow.get(id) ?? new Map())
 
@@ -203,11 +237,13 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       else allowed.set(src, rps)
     }
     let offered = 0
+    let readRps = 0
     let unitLoad = 0 // capacity units: a request from a heavy or write-heavy client counts for more
     for (const [src, rps] of allowed) {
       offered += rps
       const sc = byId.get(src)
-      unitLoad += rps * (sc ? loadUnit(c.kind, sc, c) : 1)
+      unitLoad += rps * (sc ? loadUnit(c.kind, sc, cEff) : 1)
+      readRps += sc ? rps * (configValue('client', sc.config, 'readPct') ?? 0.9) : rps
     }
     const unit = offered > 0 ? unitLoad / offered : 1
     const blockLoad = canGeoBlock(c.kind) ? blocked * BLOCK_COST[c.kind as keyof typeof BLOCK_COST] : 0
@@ -257,7 +293,9 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
     const poolSize = c.kind === 'database' ? (cfg.poolSize ?? 20) : 0
     const hold = waitsOnDownstream(c) ? (prev.hold?.[id] ?? 1) : 1
     const callFail = waitsOnDownstream(c) ? (prev.callFail?.[id] ?? 0) : 0
-    let capacity = capacityOf(c, instances, inj, hold)
+    let capacity = capacityOf(cEff, instances, inj, hold)
+    if (failing) capacity = Math.round(configValue('database', cfg, 'replicas') ?? 0) * Math.min(dbCapacity(cfg).rps, poolSize / (baseLat / 1000)) // only the replicas are left, and they can only read
+    const readShare = offered > 0 ? readRps / offered : 1
 
     // Function instances each hold a database connection while they run. Without a pooler, more of them than the
     // database allows means the extra requests are refused; a pooler shares a few connections between them all.
@@ -273,7 +311,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       if (!pooled && demand > poolSize) capacity = Math.min(capacity, offered * (poolSize / demand))
     }
 
-    const util = capacity === Infinity ? 0 : capacity === 0 ? (offered > 0 ? 2 : 0) : (unitLoad + blockLoad) / capacity
+    const util = capacity === Infinity ? 0 : capacity === 0 ? (offered > 0 ? 2 : 0) : (failing ? offered * readShare : unitLoad + blockLoad) / capacity
     let served: number
     let dropped: number
     let depth = 0
@@ -288,7 +326,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       served = Math.max(0, offered - dropped - (dt > 0 ? (d - prevDepth) / dt : 0))
       nextQueue[id] = d
     } else {
-      served = Math.min(offered, Math.max(0, capacity - blockLoad) / unit) * (1 - callFail) // calls that timed out are failures here
+      served = (failing ? Math.min(offered * readShare, capacity) : Math.min(offered, Math.max(0, capacity - blockLoad) / unit)) * (1 - callFail) // calls that timed out are failures here
       dropped = offered - served
     }
 
@@ -315,7 +353,21 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       latency = dur + cold * FUNCTION_COLD_START_MS
       cost += hourlyCost(c.kind, { ...cfg, rps: served })
     }
+    let lagMs: number | undefined
+    let staleReads: number | undefined
     if (c.kind === 'database') {
+      const reps = Math.round(configValue('database', cEff.config, 'replicas') ?? 0)
+      if (reps > 0 && !failing) {
+        // Replicas apply the primary's writes a little behind; the busier the primary, the further behind they fall.
+        lagMs = (configValue('database', cfg, 'replLagMs') ?? 50) / (1 - Math.min(util, 0.97))
+        staleReads = (reps / (1 + reps)) * (1 - Math.exp(-lagMs / STALE_WINDOW_MS))
+        nextLag[id] = lagMs
+      }
+      if (failover && failover.phase === 'failing' && !(id in (prev.killedAt ?? {}))) {
+        // The moment the primary dies: writes it had acknowledged but not yet shipped to a replica are gone.
+        nextLost[id] = (offered - readRps) * ((prev.lag?.[id] ?? 0) / 1000)
+        failover.lostWrites = nextLost[id]
+      } else if (failover) nextLost[id] = prev.lost?.[id] ?? 0
       poolUsed = Math.min(poolSize, served * (latency / 1000))
       if (conns && !conns.pooled) poolUsed = Math.min(poolSize, Math.max(poolUsed, conns.demand)) // idle connections held by functions still count
       if (conns?.pooled && conns.demand > 0) latency += 2 // waiting for a pooled connection
@@ -384,7 +436,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       if ((inj && capacity === 0) || (!limiting && (util >= 1 || (offered > 0 && dropped > 0.01 * offered)))) health = 'failed'
       else if (util >= 0.7 || (limiting && dropped > 0.01 * offered)) health = 'strained'
     }
-    nodes[id] = { offered, served, dropped, util, latency, queueDepth: depth, health, poolUsed, poolSize, hit, injected: inj, down: !!inj && capacity === 0, capacity, blocked, cold, concurrency, conns, scaling, ...(hold > 1.01 ? { hold } : {}), ...(callFail > 0.001 ? { callTimeouts: callFail } : {}) }
+    nodes[id] = { offered, served, dropped, util, latency, queueDepth: depth, health, poolUsed, poolSize, hit, injected: injRaw, down: !!inj && capacity === 0, capacity, lagMs, staleReads, failover, blocked, cold, concurrency, conns, scaling, ...(hold > 1.01 ? { hold } : {}), ...(callFail > 0.001 ? { callTimeouts: callFail } : {}) }
   }
 
   for (const e of edges) {
@@ -473,7 +525,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   const retryFactor = dt > 0 ? prev.retryFactor + (targetRetry - prev.retryFactor) * smoothing : prev.retryFactor
 
   return {
-    state: { t, retryFactor, queueDepth: nextQueue, scale: nextScale, blockedFrac, lb: nextLb, warm: nextWarm, hold: nextHold, callFail: nextCallFail },
+    state: { t, retryFactor, queueDepth: nextQueue, scale: nextScale, blockedFrac, lb: nextLb, warm: nextWarm, hold: nextHold, callFail: nextCallFail, killedAt: nextKilledAt, lag: nextLag, lost: nextLost },
     result: { nodes, edges: edgeRes, totals: { p50: Math.min(p50, 30000), p99: Math.min(p99, 30000), errorRate, throughput: completed * (1 - timeouts), offered: clientOffered, cost, retryFactor, blocked: blockedTotal, timeouts } },
   }
 }

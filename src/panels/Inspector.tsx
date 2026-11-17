@@ -62,6 +62,9 @@ function Live({ id }: { id: string }) {
       {n.scaling && n.scaling.pending > 0 && row('Starting', `+${n.scaling.pending}, ready in ${Math.ceil(n.scaling.nextReadyIn ?? 0)} s`)}
       {kind === 'queue' && row('Depth', `${Math.round(n.queueDepth)}`)}
       {kind === 'database' && n.conns && n.conns.demand >= 1 && row(n.conns.pooled ? 'Function connections (shared)' : 'Function connections', `${Math.round(n.conns.demand)}${n.conns.pooled ? '' : ` of ${n.conns.max}`}`, !n.conns.pooled && n.conns.demand > n.conns.max)}
+      {kind === 'database' && n.lagMs !== undefined && row('Replication lag', `${n.lagMs < 1000 ? Math.round(n.lagMs) : (n.lagMs / 1000).toFixed(1) + 's'}`, n.lagMs > 500)}
+      {kind === 'database' && n.staleReads !== undefined && row('Reads that may be stale', `${(n.staleReads * 100).toFixed(1)}%`, n.staleReads > 0.1)}
+      {kind === 'database' && n.failover && row(n.failover.phase === 'failing' ? 'Failover' : 'Promoted replica', n.failover.phase === 'failing' ? `writes fail, ${Math.ceil(n.failover.remainingSec)} s left` : `${Math.round(n.failover.lostWrites)} writes/s lost`, true)}
       {kind === 'database' && row('Pool in use', `${n.poolUsed.toFixed(1)} / ${n.poolSize}`, n.poolUsed >= n.poolSize * 0.9)}
       {kind === 'serverless' && row('Running now', `${n.concurrency?.toFixed(0) ?? 0} of ${useStore.getState().architecture.components.find((c) => c.id === id)?.config.concurrency ?? 1000}`, n.util >= 0.9)}
       {kind === 'serverless' && row('Cold starts', `${Math.round((n.cold ?? 0) * 100)}% of requests`, (n.cold ?? 0) > 0.05)}
