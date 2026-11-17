@@ -11,8 +11,8 @@ import { shareSlowerThan } from './latency'
 
 export type Health = 'healthy' | 'strained' | 'failed'
 export type TrafficShape = 'steady' | 'spike' | 'daily' | 'flash' | 'ramp'
-/** killed = down; slow = 4× latency and ¼ capacity; lostInstance = one instance of a scaled-out tier dies (a lone instance = down). */
-export type Injected = 'killed' | 'slow' | 'lostInstance'
+/** killed = down; slow = 4× latency and ¼ capacity; lostInstance = one instance of a scaled-out tier dies (a lone instance = down); flushed = a cache or CDN loses everything it held and starts cold. */
+export type Injected = 'killed' | 'slow' | 'lostInstance' | 'flushed'
 
 export const SHAPES: { id: TrafficShape; label: string }[] = [
   { id: 'steady', label: 'Steady' },
@@ -77,8 +77,14 @@ export interface SimState {
   lag: Record<string, number>
   /** Writes the old primary had acknowledged but not yet replicated when it died, per second of traffic (lost for good). */
   lost: Record<string, number>
+  /** Caches and CDNs: how full they are (1 = at their normal hit rate), and when a flush was first seen. */
+  warmth: Record<string, number>
+  flushedAt: Record<string, number>
+  /** Circuit breakers: state, and when it last changed. */
+  breaker: Record<string, { state: BreakerState; since: number }>
 }
-export const freshState = (): SimState => ({ t: 0, retryFactor: 0, queueDepth: {}, scale: {}, blockedFrac: {}, lb: {}, warm: {}, hold: {}, callFail: {}, killedAt: {}, lag: {}, lost: {} })
+export type BreakerState = 'closed' | 'open' | 'half'
+export const freshState = (): SimState => ({ t: 0, retryFactor: 0, queueDepth: {}, scale: {}, blockedFrac: {}, lb: {}, warm: {}, hold: {}, callFail: {}, killedAt: {}, lag: {}, lost: {}, warmth: {}, flushedAt: {}, breaker: {} })
 
 /** Scale in only after this long without a change, and only if the smaller tier would still be comfortably loaded. */
 const SCALE_IN_COOLDOWN_S = 30
@@ -110,6 +116,11 @@ export interface NodeResult {
   hold?: number
   /** Share of this tier's downstream calls that hit its call timeout. */
   callTimeouts?: number
+  /** Caches and CDNs: share of the normal hit rate they are delivering (0 right after a flush), and how much their misses are multiplied by a stampede. */
+  warmth?: number
+  stampede?: number
+  /** App tiers with a circuit breaker: its state. Open means requests fail fast and nothing goes downstream. */
+  breaker?: BreakerState
   /** Databases with replicas: how far behind the primary the replicas are, and the share of reads that may return stale data. */
   lagMs?: number
   staleReads?: number
@@ -159,6 +170,13 @@ function capacityOf(c: ArchComponent, instances: number, inj: Injected | undefin
 /** A read replica is this likely to be behind on a hot row after `lag` ms: 1 − e^(−lag / 2 s). An assumed figure. */
 const STALE_WINDOW_MS = 2000
 
+/** Without coalescing, a cold cache sends duplicate loads for the same key: misses are multiplied by up to 1 + this. */
+const STAMPEDE_MAX = 2
+const HALF_OPEN_PASS = 0.1
+const HALF_OPEN_PROBE_S = 2
+
+const hasBreaker = (c: ArchComponent) => c.kind === 'appServers' && (configValue('appServers', c.config, 'breaker') ?? 0) >= 0.5
+
 const waitsOnDownstream = (c: ArchComponent) => c.kind === 'appServers' && (configValue('appServers', c.config, 'blocking') ?? 0) >= 0.5
 
 export function step(arch: Architecture, prev: SimState, dt: number, opts: { shape: TrafficShape; injected?: Record<string, Injected> }): { state: SimState; result: StepResult } {
@@ -195,6 +213,9 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   const nextLb: Record<string, EdgeLb> = {}
   const nextWarm: Record<string, number> = {}
   const nextKilledAt: Record<string, number> = {}
+  const nextBreaker: SimState['breaker'] = {}
+  const nextWarmth: Record<string, number> = {}
+  const nextFlushedAt: Record<string, number> = {}
   const nextLag: Record<string, number> = {}
   const nextLost: Record<string, number> = {}
   const blockedBySrc: Record<string, number> = {}
@@ -373,12 +394,34 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       if (conns?.pooled && conns.demand > 0) latency += 2 // waiting for a pooled connection
     }
 
+    // Circuit breaker: when the calls downstream keep failing, stop making them. Open means requests fail fast here
+    // (cheap for this tier, and the downstream gets a rest); half-open lets a small share through to test it.
+    let breakerState: BreakerState | undefined
+    if (hasBreaker(c) && (outs.get(id)?.length ?? 0) > 0) {
+      const b = prev.breaker?.[id] ?? { state: 'closed' as BreakerState, since: t }
+      breakerState = b.state
+      nextBreaker[id] = b
+      const shed = b.state === 'open' ? 1 : b.state === 'half' ? 1 - HALF_OPEN_PASS : 0
+      if (shed > 0) { const s = served * shed; served -= s; dropped += s }
+    }
+
     let forward = served
     let hit = 0
+    let warmth: number | undefined
+    let stampede: number | undefined
     if (c.kind === 'cache' || c.kind === 'cdn') {
-      hit = cfg.hitRate ?? 0.8
+      // A flush empties it; it then refills over the warm-up time. Until it has, the hit rate is lower.
+      let w = prev.warmth?.[id] ?? 1
+      if (inj === 'flushed') {
+        if (prev.flushedAt?.[id] === undefined) { w = 0; nextFlushedAt[id] = t } else nextFlushedAt[id] = prev.flushedAt[id]
+      }
+      w = Math.min(1, w + (dt > 0 ? dt / (configValue(c.kind, cfg, 'warmSec') ?? 30) : 0))
+      if (w < 1) nextWarmth[id] = w
+      warmth = w
+      hit = (cfg.hitRate ?? 0.8) * w
+      stampede = (configValue(c.kind, cfg, 'coalesce') ?? 0) >= 0.5 ? 1 : 1 + STAMPEDE_MAX * (1 - w)
       completed += served * hit
-      forward = served * (1 - hit)
+      forward = served * (1 - hit) * stampede // duplicate loads for the same missing key add to the misses
     }
     const o = outs.get(id) ?? []
     const passed = offered > 0 ? forward / offered : 0 // every source loses the same share to drops and cache hits
@@ -436,7 +479,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       if ((inj && capacity === 0) || (!limiting && (util >= 1 || (offered > 0 && dropped > 0.01 * offered)))) health = 'failed'
       else if (util >= 0.7 || (limiting && dropped > 0.01 * offered)) health = 'strained'
     }
-    nodes[id] = { offered, served, dropped, util, latency, queueDepth: depth, health, poolUsed, poolSize, hit, injected: injRaw, down: !!inj && capacity === 0, capacity, lagMs, staleReads, failover, blocked, cold, concurrency, conns, scaling, ...(hold > 1.01 ? { hold } : {}), ...(callFail > 0.001 ? { callTimeouts: callFail } : {}) }
+    nodes[id] = { offered, served, dropped, util, latency, queueDepth: depth, health, poolUsed, poolSize, hit, injected: injRaw, down: !!inj && capacity === 0, capacity, lagMs, staleReads, failover, blocked, cold, concurrency, conns, scaling, warmth, stampede, breaker: breakerState, ...(hold > 1.01 ? { hold } : {}), ...(callFail > 0.001 ? { callTimeouts: callFail } : {}) }
   }
 
   for (const e of edges) {
@@ -451,17 +494,46 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   const nextCallFail: Record<string, number> = {}
   const downLat: Record<string, number> = {}
   const downBase: Record<string, number> = {}
+  const downFail: Record<string, number> = {} // share of requests that fail somewhere behind this node
   for (const id of [...order].reverse()) {
     const n = nodes[id]
-    let d = 0, b = 0
+    let d = 0, b = 0, f = 0
     if (n.served > 0) for (const e of outs.get(id) ?? []) {
       const share = (edgeRes[e.id]?.rps ?? 0) / n.served
       const tc = byId.get(e.to)!
-      d += share * (nodes[e.to].latency + downLat[e.to])
+      const tn = nodes[e.to]
+      d += share * (tn.latency + downLat[e.to])
       b += share * (BASE_LATENCY_MS[tc.kind] + downBase[e.to])
+      const drop = tn.offered > 0 ? tn.dropped / tn.offered : 0
+      f += share * (drop + (1 - drop) * downFail[e.to])
     }
     downLat[id] = d
     downBase[id] = b
+    downFail[id] = Math.min(1, f)
+  }
+  // Circuit breakers change state from what the calls downstream did this step.
+  for (const c of arch.components) {
+    const cur = nextBreaker[c.id]
+    if (!cur) continue
+    const thr = configValue('appServers', c.config, 'breakerErrPct') ?? 0.25
+    const openFor = configValue('appServers', c.config, 'breakerOpenSec') ?? 10
+    let sent = 0, failed = 0
+    for (const e of outs.get(c.id) ?? []) {
+      const r = edgeRes[e.id]?.rps ?? 0
+      const tn = nodes[e.to]
+      const drop = tn.offered > 0 ? tn.dropped / tn.offered : 0
+      sent += r
+      failed += r * (drop + (1 - drop) * downFail[e.to])
+    }
+    const calls = sent > 0 ? failed / sent : 0
+    const err = 1 - (1 - calls) * (1 - (prev.callFail?.[c.id] ?? 0)) // calls that ran past the call timeout count as failures too
+    if (dt <= 0) continue
+    if (cur.state === 'closed' && sent > 0 && err > thr) nextBreaker[c.id] = { state: 'open', since: t }
+    else if (cur.state === 'open' && t - cur.since >= openFor) nextBreaker[c.id] = { state: 'half', since: t }
+    else if (cur.state === 'half') {
+      if (sent > 0 && err > thr) nextBreaker[c.id] = { state: 'open', since: t }
+      else if (t - cur.since >= HALF_OPEN_PROBE_S) nextBreaker[c.id] = { state: 'closed', since: t }
+    }
   }
   for (const c of arch.components) {
     if (!waitsOnDownstream(c)) continue
@@ -525,7 +597,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   const retryFactor = dt > 0 ? prev.retryFactor + (targetRetry - prev.retryFactor) * smoothing : prev.retryFactor
 
   return {
-    state: { t, retryFactor, queueDepth: nextQueue, scale: nextScale, blockedFrac, lb: nextLb, warm: nextWarm, hold: nextHold, callFail: nextCallFail, killedAt: nextKilledAt, lag: nextLag, lost: nextLost },
+    state: { t, retryFactor, queueDepth: nextQueue, scale: nextScale, blockedFrac, lb: nextLb, warm: nextWarm, hold: nextHold, callFail: nextCallFail, killedAt: nextKilledAt, lag: nextLag, lost: nextLost, warmth: nextWarmth, flushedAt: nextFlushedAt, breaker: nextBreaker },
     result: { nodes, edges: edgeRes, totals: { p50: Math.min(p50, 30000), p99: Math.min(p99, 30000), errorRate, throughput: completed * (1 - timeouts), offered: clientOffered, cost, retryFactor, blocked: blockedTotal, timeouts } },
   }
 }

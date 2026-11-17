@@ -19,6 +19,20 @@ function why(c: ArchComponent, n: NodeResult): { title: string; reasons: string[
   const cfg = c.config
   const dropPct = n.offered > 0 ? Math.round((n.dropped / n.offered) * 100) : 0
 
+  if (c.kind === 'appServers' && (n.breaker === 'open' || n.breaker === 'half')) {
+    return {
+      kind: 'breaker',
+      title: `${name} is shedding load (circuit breaker ${n.breaker === 'open' ? 'open' : 'testing'})`,
+      reasons: [
+        n.breaker === 'open'
+          ? `The calls ${name} makes downstream kept failing, so its circuit breaker opened: requests now fail fast here and nothing is sent downstream until the breaker tries again.`
+          : `${name}'s circuit breaker is testing the downstream with a small share of traffic. If those calls succeed it closes; if not it opens again.`,
+        `${dropPct}% of requests are failing fast at this tier. That is the price of keeping workers free and giving the downstream service room to recover.`,
+      ],
+      hint: 'Fix what is failing downstream. Once calls succeed again the breaker closes by itself.',
+    }
+  }
+
   if (n.failover?.phase === 'failing') {
     const reps = Math.round(cfg.replicas ?? 0)
     const reasons = [
@@ -117,6 +131,11 @@ export function analyze(arch: Architecture, res: StepResult): Insight | null {
   const w = why(worst.c, worst.n)
   const reasons = [...w.reasons]
   const retry = res.totals.retryFactor
+  for (const cc of arch.components) {
+    const cn = res.nodes[cc.id]
+    if ((cc.kind !== 'cache' && cc.kind !== 'cdn') || !cn || cn.warmth === undefined || cn.warmth >= 0.9) continue
+    reasons.push(`${cc.name} is only ${Math.round(cn.warmth * 100)}% warm after a flush, so most reads fall through to what is behind it.${cn.stampede && cn.stampede > 1.2 ? ` Without request coalescing, many requests for the same missing item each load it separately (about ${cn.stampede.toFixed(1)}× the misses).` : ''}`)
+  }
   if (res.totals.timeouts > 0.05) reasons.push(`${Math.round(res.totals.timeouts * 100)}% of requests run past the client timeout and count as failures.`)
   if (retry > 0.15) reasons.push(`Clients are retrying failed requests, adding about ${Math.round(retry * 100)}% more load. This retry storm keeps the problem going.`)
   return { key: `${worst.c.id}:${w.kind}`, nodeId: worst.c.id, title: w.title, reasons, hint: w.hint }

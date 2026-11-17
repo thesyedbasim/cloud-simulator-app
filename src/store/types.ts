@@ -82,6 +82,9 @@ export const CONFIG_SCHEMA: Record<ComponentKind, ConfigField[]> = {
     { key: 'vcpu', label: 'vCPUs per instance', min: 1, max: 32, step: 1, group: 'Instance size' },
     { key: 'ramGb', label: 'Memory per instance', min: 1, max: 128, step: 1, unit: 'GB', group: 'Instance size' },
     { key: 'blocking', label: 'Workers wait on downstream calls', min: 0, max: 1, step: 1, toggle: true, optional: true, group: 'Downstream calls' },
+    { key: 'breaker', label: 'Circuit breaker', min: 0, max: 1, step: 1, toggle: true, optional: true, group: 'Downstream calls' },
+    { key: 'breakerErrPct', label: 'Open when downstream errors exceed', min: 0.05, max: 1, step: 0.05, pct: true, showIf: 'breaker', optional: true, group: 'Downstream calls' },
+    { key: 'breakerOpenSec', label: 'Stay open for', min: 2, max: 60, step: 1, unit: 's', showIf: 'breaker', optional: true, group: 'Downstream calls' },
     { key: 'callTimeoutMs', label: 'Call timeout (0 = wait forever)', min: 0, max: 10000, step: 100, unit: 'ms', showIf: 'blocking', optional: true, group: 'Downstream calls' },
     { key: 'geoMode', label: 'Geo rule', min: 0, max: 2, step: 1, optional: true, hidden: true },
     { key: 'geoMask', label: 'Geo regions', min: 0, max: 63, step: 1, optional: true, hidden: true },
@@ -100,8 +103,16 @@ export const CONFIG_SCHEMA: Record<ComponentKind, ConfigField[]> = {
     { key: 'replLagMs', label: 'Replication lag when idle', min: 10, max: 2000, step: 10, unit: 'ms', optional: true, group: 'Replicas' },
     { key: 'failoverSec', label: 'Failover time (promote a replica)', min: 5, max: 300, step: 5, unit: 's', optional: true, group: 'Replicas' },
   ],
-  cache: [{ key: 'hitRate', label: 'Hit rate', min: 0, max: 1, step: 0.05, pct: true }],
-  cdn: [{ key: 'hitRate', label: 'Hit rate', min: 0.5, max: 0.99, step: 0.01, pct: true }],
+  cache: [
+    { key: 'hitRate', label: 'Hit rate', min: 0, max: 1, step: 0.05, pct: true },
+    { key: 'warmSec', label: 'Time to warm up after a flush', min: 5, max: 300, step: 5, unit: 's', optional: true, group: 'Cold cache' },
+    { key: 'coalesce', label: 'Request coalescing (one load per missing key)', min: 0, max: 1, step: 1, toggle: true, optional: true, group: 'Cold cache' },
+  ],
+  cdn: [
+    { key: 'hitRate', label: 'Hit rate', min: 0.5, max: 0.99, step: 0.01, pct: true },
+    { key: 'warmSec', label: 'Time to warm up after a flush', min: 5, max: 300, step: 5, unit: 's', optional: true, group: 'Cold cache' },
+    { key: 'coalesce', label: 'Request coalescing (one load per missing key)', min: 0, max: 1, step: 1, toggle: true, optional: true, group: 'Cold cache' },
+  ],
   bucket: [
     { key: 'prefixes', label: 'Key prefixes (spreads load)', min: 1, max: 10, step: 1 },
     { key: 'storageGb', label: 'Stored data', min: 10, max: 5000, step: 10, unit: 'GB' },
@@ -132,7 +143,9 @@ export const OPTIONAL_DEFAULTS: Partial<Record<ComponentKind, Record<string, num
   database: { pooler: 0, replicas: 0, replLagMs: 50, failoverSec: 30 },
   client: { region: 0, clientType: 0, payloadKb: 4, readPct: 0.9, weight: 1, retries: 2, backoff: 0, timeoutMs: 0 },
   loadBalancer: { geoMode: 0, geoMask: 0, policy: 0, healthCheck: 1, hcInterval: 5, hcFails: 3, slowStartSec: 0, drainSec: 0 },
-  appServers: { autoscale: 0, maxInstances: 8, warmupSec: 20, scaleUpAt: 0.7, geoMode: 0, geoMask: 0, blocking: 0, callTimeoutMs: 0 },
+  appServers: { autoscale: 0, maxInstances: 8, warmupSec: 20, scaleUpAt: 0.7, geoMode: 0, geoMask: 0, blocking: 0, callTimeoutMs: 0, breaker: 0, breakerErrPct: 0.25, breakerOpenSec: 10 },
+  cache: { warmSec: 30, coalesce: 0 },
+  cdn: { warmSec: 30, coalesce: 0 },
 }
 
 /** A setting's value, falling back to its default when the component does not carry it. */

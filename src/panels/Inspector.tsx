@@ -69,6 +69,9 @@ function Live({ id }: { id: string }) {
       {kind === 'serverless' && row('Running now', `${n.concurrency?.toFixed(0) ?? 0} of ${useStore.getState().architecture.components.find((c) => c.id === id)?.config.concurrency ?? 1000}`, n.util >= 0.9)}
       {kind === 'serverless' && row('Cold starts', `${Math.round((n.cold ?? 0) * 100)}% of requests`, (n.cold ?? 0) > 0.05)}
       {(kind === 'cache' || kind === 'cdn') && row('Hit rate', `${Math.round(n.hit * 100)}%`)}
+      {(kind === 'cache' || kind === 'cdn') && n.warmth !== undefined && n.warmth < 0.99 && row('Warmth', `${Math.round(n.warmth * 100)}%`, n.warmth < 0.5)}
+      {(kind === 'cache' || kind === 'cdn') && n.stampede !== undefined && n.stampede > 1.05 && row('Miss amplification', `${n.stampede.toFixed(1)}×`, true)}
+      {n.breaker && n.breaker !== 'closed' && row('Circuit breaker', n.breaker === 'open' ? 'open: failing fast' : 'testing', true)}
     </div>
   )
 }
