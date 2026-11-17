@@ -19,6 +19,7 @@ import { PRESETS } from '../presets/index'
 import { ReviewDialog } from '../panels/ReviewDialog'
 import { Scenarios } from '../panels/Scenarios'
 import { ChaosButton, ChaosDialog } from '../panels/ChaosDialog'
+import { ChallengesButton, ChallengesDialog } from '../panels/Challenges'
 import { ContextMenu } from '../panels/ContextMenu'
 import { InsightCard } from '../panels/InsightCard'
 import { SimControls } from '../panels/SimControls'
@@ -55,6 +56,7 @@ function TopBar() {
         <SimControls />
         <Scenarios />
         <ChaosButton />
+        <ChallengesButton />
         <button onClick={() => useTrace.getState().start()} title="Trace one request through the system (or Shift-click a moving dot)" className="flex items-center gap-1.5 rounded-control border border-line/15 px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-line/10 active:scale-95"><Route size={13} className="text-accent" /> <span className="hidden lg:inline">Trace</span></button>
         <ReviewButton />
         <span className="h-5 w-px bg-line/15" />
@@ -177,6 +179,7 @@ export default function App() {
       <InsightCard />
       <ReviewDialog />
       <ChaosDialog />
+      <ChallengesDialog />
       <HoverTooltip />
       <ContextMenu />
       <Toaster theme="light" position="bottom-right" offset={{ bottom: 112, right: 16 }} mobileOffset={{ bottom: 112, right: 12 }} />

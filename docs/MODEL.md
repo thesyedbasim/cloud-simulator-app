@@ -174,3 +174,16 @@ A **chaos experiment** is a list of events on a timeline: at `t` seconds, apply 
 The faults offered for a component are the ones that make sense for its kind (for example *Flush* only for caches and CDNs, *Hot key* only for databases and queues).
 
 **Not modelled:** faults with a duration (use a fault and a later restore), randomised faults, and conditions ("if errors exceed 5 %, then…").
+
+## Guided challenges (Stage 9)
+
+A **challenge** is a starting design with a problem, goals, hints and a root cause that is shown only once it is solved (`sim/challenges.ts`). Goals are checked by the same engine as everything else, so meeting one means the design really survives that scenario:
+
+- *survive* a scenario: errors never exceed 2 % of requests;
+- *recover* from a scenario: errors are back under 2 % at a given second (the system may fail meanwhile), which is how a retry storm that never ends is told apart from one that does;
+- *cost*: steady-state estimated cost per hour is within a budget (which is what rules out brute-forcing a problem with hardware);
+- *recovery*: every database's RTO and RPO (Stage 7) are within limits.
+
+Seven challenges, from beginner to advanced: *The Black Friday spike*, *Lose a server, keep the site*, *When the cache forgets*, *The outage that would not end* (a metastable failure: five retries per failed request keep a recovered system down; backoff or fewer retries lets it recover), *The slow database that took down the app* (a cascading failure through blocked workers), *The celebrity problem* (a hot key on a sharded database) and *A zone goes dark*. The incident ones retell kinds of outage, not specific events. Every challenge has a test that its starting design fails, that a reference answer passes, and that the obvious wrong answer (more servers, more shards, a bigger database) does not.
+
+The dialog checks the design against the active challenge as you edit it (deferred, so editing stays smooth). Solved ids are kept in browser storage only. Starting a challenge replaces the current design as one undo step.

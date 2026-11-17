@@ -22,6 +22,7 @@ export function openDesign(arch: Architecture, message?: string) {
   const st = useStore.getState()
   st.loadArchitecture(arch)
   useSim.getState().stopScenario() // a scenario belongs to the design it was started on
+  useSim.getState().stopExperiment() // and so does a chaos experiment
   resetSim()
   requestAnimationFrame(() => sceneRef.current?.fit(false))
   toast(message ?? `Opened ${arch.name}`, { action: { label: 'Undo', onClick: () => { useStore.getState().undo(); requestAnimationFrame(() => sceneRef.current?.fit(false)) } } })
