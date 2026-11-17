@@ -59,6 +59,10 @@ export const CONFIG_SCHEMA: Record<ComponentKind, ConfigField[]> = {
   gateway: [
     { key: 'limitOn', label: 'Rate limit', min: 0, max: 1, step: 1, toggle: true, optional: true },
     { key: 'rateLimit', label: 'Requests allowed per second', min: 100, max: 10000, step: 100, unit: 'rps', showIf: 'limitOn' },
+    { key: 'limitAlgo', label: 'Algorithm (0 fixed, 1 token bucket, 2 leaky bucket)', min: 0, max: 2, step: 1, showIf: 'limitOn', optional: true, hidden: true },
+    { key: 'burstSec', label: 'Burst allowance (seconds of traffic at the limit)', min: 0.5, max: 10, step: 0.5, unit: 's', showIf: 'limitOn', optional: true, group: 'Rate limiter' },
+    { key: 'perClientOn', label: 'Limit each client separately', min: 0, max: 1, step: 1, toggle: true, showIf: 'limitOn', optional: true, group: 'Rate limiter' },
+    { key: 'perClientRps', label: 'Allowed per client', min: 10, max: 5000, step: 10, unit: 'rps', showIf: 'perClientOn', optional: true, group: 'Rate limiter' },
     { key: 'geoMode', label: 'Geo rule', min: 0, max: 2, step: 1, optional: true, hidden: true },
     { key: 'geoMask', label: 'Geo regions', min: 0, max: 63, step: 1, optional: true, hidden: true },
   ],
@@ -145,7 +149,7 @@ export const DEFAULT_CONFIG: Record<ComponentKind, Record<string, number>> = {
 
 /** Defaults for optional settings, used when a component does not carry them. */
 export const OPTIONAL_DEFAULTS: Partial<Record<ComponentKind, Record<string, number>>> = {
-  gateway: { limitOn: 1, geoMode: 0, geoMask: 0 },
+  gateway: { limitOn: 1, geoMode: 0, geoMask: 0, limitAlgo: 0, burstSec: 2, perClientOn: 0, perClientRps: 500 },
   serverless: { provisioned: 0 },
   database: { pooler: 0, replicas: 0, replLagMs: 50, failoverSec: 30, shards: 1, hotShare: 0 },
   queue: { partitions: 0, consumers: 1, hotKeyShare: 0, poisonPct: 0, dlq: 0 },

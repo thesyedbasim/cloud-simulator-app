@@ -1,7 +1,7 @@
 import type { Architecture, ArchComponent } from '../store/types'
 import type { Injected, TrafficShape } from './engine'
 
-export type ScenarioId = 'spike' | 'nodeFailure' | 'slowDb' | 'cacheFlush' | 'retryStorm' | 'zoneOutage' | 'grayFailure' | 'badDeploy' | 'thunderingHerd' | 'hotPartition'
+export type ScenarioId = 'spike' | 'nodeFailure' | 'slowDb' | 'cacheFlush' | 'retryStorm' | 'zoneOutage' | 'grayFailure' | 'badDeploy' | 'thunderingHerd' | 'hotPartition' | 'botFlood'
 
 export const SCENARIOS: { id: ScenarioId; label: string; blurb: string }[] = [
   { id: 'spike', label: 'Traffic spike', blurb: 'Load triples for about 20 s' },
@@ -13,6 +13,7 @@ export const SCENARIOS: { id: ScenarioId; label: string; blurb: string }[] = [
   { id: 'grayFailure', label: 'Gray failure', blurb: 'A tier looks alive to health checks but is 4× slower' },
   { id: 'badDeploy', label: 'Bad deploy', blurb: 'A faulty release makes 30% of requests fail' },
   { id: 'thunderingHerd', label: 'Thundering herd', blurb: 'Servers restart together, behind cold caches' },
+  { id: 'botFlood', label: 'Bot flood', blurb: 'One client suddenly sends 8× its traffic' },
   { id: 'hotPartition', label: 'Hot partition', blurb: 'One key dominates and a single shard or partition takes most of the load' },
 ]
 
@@ -83,6 +84,12 @@ export function planScenario(arch: Architecture, id: ScenarioId): ScenarioPlan {
       const t = entryTier(comps)
       if (!t) return none(5, 'Add an App Servers or Serverless component first.')
       return { id, label, injections: { [t.id]: 'bad' }, at: 5, summary: `A faulty release reaches ${t.name} after 5 s: capacity is fine, but 30% of requests fail. Restore it from the inspector to roll back.` }
+    }
+    case 'botFlood': {
+      const clients = comps.filter((c) => c.kind === 'client')
+      if (!clients.length) return none(5, 'Add a Client first.')
+      const bot = clients.find((c) => Math.round(c.config.clientType ?? 0) === 2) ?? clients[clients.length - 1]
+      return { id, label, injections: { [bot.id]: 'flood' }, at: 5, summary: `After 5 s ${bot.name} sends 8× its normal traffic. A rate limit with a per-client allowance keeps the other clients served.` }
     }
     case 'hotPartition': {
       const hot = comps.filter((c) => (c.kind === 'database' && (c.config.shards ?? 1) > 1) || (c.kind === 'queue' && (c.config.partitions ?? 0) > 1))

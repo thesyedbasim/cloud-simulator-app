@@ -142,3 +142,17 @@ New faults: `zoneLoss` (a lone instance is down; otherwise `floor(n/2)` of `n` i
 **Presets.** *Social Feed* (four shards, one taking half the traffic) and *Event Pipeline* (four partitions, three consumers, one hot partition).
 
 **Not modelled:** resharding cost and downtime, cross-shard queries, per-partition backlog (the queue depth is the total), ordering guarantees, consumer rebalancing pauses.
+
+## Rate limiting (Stage 6)
+
+An API gateway's rate limit now has three algorithms (`limitAlgo`; the fixed limit stays the default, so existing designs are unchanged):
+
+- **Fixed limit.** Anything over the limit is turned away at once (a 429).
+- **Token bucket.** The bucket holds `limit × burst allowance` tokens (default 2 s of traffic) and starts full. Each step the gateway can pass `limit + tokens / dt`, spending tokens when traffic is over the limit and refilling at `limit − served` when it is under. So a burst passes in full while the bucket lasts, then the gateway holds the line at the limit; a quiet period refills it. The capacity the inspector shows is the configured limit, not the transient burst capacity.
+- **Leaky bucket.** Requests over the limit wait in a queue (up to `limit × burst allowance`) and are released at the limit rate, so downstream sees a smooth stream and nothing is dropped until the queue is full. The price is latency: waiting time is `depth / limit`.
+
+**Per-client limits.** With "Limit each client separately", every client is capped at its own allowance before the shared limit is applied. What a client sends over its allowance is turned away and counted as dropped, like any 429. Without it, a noisy client takes most of the shared limit and every client loses the same share (a bot sending 3 000 rps next to a user sending 300 against a 2 000 rps limit leaves both with about 60 %). The gateway reports the share of each client's requests that got through.
+
+**Bot flood.** A new `flood` fault (and the **Bot flood** scenario, which picks a bot client if there is one) makes a client send 8× its normal traffic. The 8× is an assumed figure.
+
+**Not modelled:** distributed limiters (several gateways sharing a bucket), limits keyed on anything but the client, sliding windows, and the `Retry-After` behaviour of well-behaved clients.

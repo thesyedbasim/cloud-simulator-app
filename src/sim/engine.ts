@@ -11,8 +11,8 @@ import { shareSlowerThan } from './latency'
 
 export type Health = 'healthy' | 'strained' | 'failed'
 export type TrafficShape = 'steady' | 'spike' | 'daily' | 'flash' | 'ramp'
-/** killed = down; slow = 4× latency and ¼ capacity; lostInstance = one instance of a scaled-out tier dies (a lone instance = down); flushed = a cache or CDN loses everything it held and starts cold; zoneLoss = a failure zone is lost (half the instances of a scaled-out tier, rounded up; a lone instance = down); bad = a bad release (capacity is fine but a share of requests error out); hotKey = one key dominates, so most of a sharded database's or partitioned queue's traffic lands on a single shard or partition. */
-export type Injected = 'killed' | 'slow' | 'lostInstance' | 'flushed' | 'zoneLoss' | 'bad' | 'hotKey'
+/** killed = down; slow = 4× latency and ¼ capacity; lostInstance = one instance of a scaled-out tier dies (a lone instance = down); flushed = a cache or CDN loses everything it held and starts cold; zoneLoss = a failure zone is lost (half the instances of a scaled-out tier, rounded up; a lone instance = down); bad = a bad release (capacity is fine but a share of requests error out); hotKey = one key dominates, so most of a sharded database's or partitioned queue's traffic lands on a single shard or partition; flood = a client (a bot, a runaway job) sends several times its normal traffic. */
+export type Injected = 'killed' | 'slow' | 'lostInstance' | 'flushed' | 'zoneLoss' | 'bad' | 'hotKey' | 'flood'
 
 export const SHAPES: { id: TrafficShape; label: string }[] = [
   { id: 'steady', label: 'Steady' },
@@ -48,6 +48,8 @@ const HOLD_GRACE = 1.15
 const SLOW_FACTOR = 4
 /** Share of requests a bad release makes fail. */
 export const BAD_RELEASE_RATE = 0.3
+/** How many times its normal rate a flooding client sends. */
+export const FLOOD_FACTOR = 8
 
 /** Autoscaling bookkeeping for one app tier. */
 export interface ScaleState {
@@ -77,6 +79,8 @@ export interface SimState {
   /** Databases with replicas: sim time the primary was first seen down, and the replication lag (ms) last step. */
   killedAt: Record<string, number>
   lag: Record<string, number>
+  /** Gateways with a token bucket (tokens left) or a leaky bucket (requests waiting). */
+  bucket: Record<string, number>
   /** Partitioned queues with a dead-letter queue: messages parked there so far. */
   dlq: Record<string, number>
   /** Writes the old primary had acknowledged but not yet replicated when it died, per second of traffic (lost for good). */
@@ -88,7 +92,7 @@ export interface SimState {
   breaker: Record<string, { state: BreakerState; since: number }>
 }
 export type BreakerState = 'closed' | 'open' | 'half'
-export const freshState = (): SimState => ({ t: 0, retryFactor: 0, queueDepth: {}, scale: {}, blockedFrac: {}, lb: {}, warm: {}, hold: {}, callFail: {}, killedAt: {}, lag: {}, dlq: {}, lost: {}, warmth: {}, flushedAt: {}, breaker: {} })
+export const freshState = (): SimState => ({ t: 0, retryFactor: 0, queueDepth: {}, scale: {}, blockedFrac: {}, lb: {}, warm: {}, hold: {}, callFail: {}, killedAt: {}, lag: {}, bucket: {}, dlq: {}, lost: {}, warmth: {}, flushedAt: {}, breaker: {} })
 
 /** Scale in only after this long without a change, and only if the smaller tier would still be comfortably loaded. */
 const SCALE_IN_COOLDOWN_S = 30
@@ -120,6 +124,8 @@ export interface NodeResult {
   hold?: number
   /** Share of this tier's downstream calls that hit its call timeout. */
   callTimeouts?: number
+  /** Rate-limiting gateways: algorithm, what is left in the bucket (tokens, or requests waiting), requests turned away for exceeding a per-client limit, and the share of each client's requests that got through. */
+  limiter?: { algo: 0 | 1 | 2; level: number; max: number; limitedByClient: number; passShare: Record<string, number> }
   /** Sharded databases: shard count, the busiest shard's share of traffic, and what an even spread would give it. */
   shards?: { count: number; hot: number; even: number }
   /** Partitioned queues: partitions, consumers doing work, consumers with nothing to read, the busiest partition's share, and dead-lettered messages. */
@@ -223,6 +229,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   const nextWarm: Record<string, number> = {}
   const nextKilledAt: Record<string, number> = {}
   const nextDlq: Record<string, number> = {}
+  const nextBucket: Record<string, number> = {}
   const nextBreaker: SimState['breaker'] = {}
   const nextWarmth: Record<string, number> = {}
   const nextFlushedAt: Record<string, number> = {}
@@ -256,7 +263,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       }
     }
     const slow = inj === 'slow' ? SLOW_FACTOR : 1
-    const arriving: Map<string, number> = c.kind === 'client' ? new Map([[id, (cfg.rps ?? 0) * mult * (1 + prev.retryFactor * (1 - (prev.blockedFrac?.[id] ?? 0)))]]) : (inflow.get(id) ?? new Map())
+    const arriving: Map<string, number> = c.kind === 'client' ? new Map([[id, (cfg.rps ?? 0) * mult * (injRaw === 'flood' ? FLOOD_FACTOR : 1) * (1 + prev.retryFactor * (1 - (prev.blockedFrac?.[id] ?? 0)))]]) : (inflow.get(id) ?? new Map())
 
     // Geo rule: traffic from a turned-away region never reaches the capacity maths below, apart from the small
     // cost of saying no (cheap at a load balancer, a little more at an app tier).
@@ -266,6 +273,16 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       const sc = byId.get(src)
       if (canGeoBlock(c.kind) && sc && !geoAllows(c, regionOf(sc))) { blocked += rps; blockedBySrc[src] = (blockedBySrc[src] ?? 0) + rps }
       else allowed.set(src, rps)
+    }
+    // A rate-limiting gateway with a per-client limit caps every client on its own, so one noisy client cannot take
+    // the share of the others. What a client sends over its limit is turned away here (counted as dropped below).
+    const limitOn = c.kind === 'gateway' && (configValue('gateway', cfg, 'limitOn') ?? 1) >= 0.5
+    const limitAlgo = limitOn ? (Math.round(configValue('gateway', cfg, 'limitAlgo') ?? 0) as 0 | 1 | 2) : 0
+    const original = limitOn ? new Map(allowed) : null
+    let limitedByClient = 0
+    if (limitOn && (configValue('gateway', cfg, 'perClientOn') ?? 0) >= 0.5) {
+      const cap = configValue('gateway', cfg, 'perClientRps') ?? 500
+      for (const [src, rps] of allowed) if (rps > cap) { allowed.set(src, cap); limitedByClient += rps - cap }
     }
     let offered = 0
     let readRps = 0
@@ -329,6 +346,14 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
     let capacity = capacityOf(cEff, instances, inj, hold)
     if (failing) capacity = Math.round(configValue('database', cfg, 'replicas') ?? 0) * Math.min(dbCapacity(cfg).rps, poolSize / (baseLat / 1000)) // only the replicas are left, and they can only read
     const readShare = offered > 0 ? readRps / offered : 1
+    // Token bucket: a quiet period fills the bucket, and a burst may spend it on top of the steady rate.
+    const rateLimit = c.kind === 'gateway' ? (cfg.rateLimit ?? 2000) : 0
+    const burst = rateLimit * (configValue('gateway', cfg, 'burstSec') ?? 2)
+    let tokens: number | undefined
+    if (limitAlgo === 1 && !inj) {
+      tokens = Math.min(burst, prev.bucket?.[id] ?? burst)
+      if (dt > 0) capacity = rateLimit + tokens / dt
+    }
 
     // Function instances each hold a database connection while they run. Without a pooler, more of them than the
     // database allows means the extra requests are refused; a pooler shares a few connections between them all.
@@ -349,8 +374,9 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
     let dropped: number
     let depth = 0
     let broker: NodeResult['broker']
-    if (c.kind === 'queue') {
-      const maxDepth = cfg.maxDepth ?? 2000
+    const leaky = limitAlgo === 2 && !inj // a leaky bucket queues what is over the rate instead of dropping it, up to the burst allowance
+    if (c.kind === 'queue' || leaky) {
+      const maxDepth = c.kind === 'queue' ? (cfg.maxDepth ?? 2000) : burst
       const prevDepth = prev.queueDepth[id] ?? 0
       let d = Math.max(0, prevDepth + (offered - capacity) * dt)
       let overflow = 0
@@ -376,7 +402,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
     let latency = baseLat / (1 - rho)
     if (c.kind === 'queue') latency += (depth / Math.max(1, capacity)) * 1000
     if (util >= 1) latency = Math.max(latency, baseLat * 50)
-    if (c.kind === 'gateway' && !inj) latency = baseLat // turning a request away is quick; it does not queue
+    if (c.kind === 'gateway' && !inj) latency = baseLat + (leaky ? (depth / Math.max(1, capacity)) * 1000 : 0) // turning a request away is quick; a leaky bucket makes the ones it holds wait
     let cold: number | undefined
     let concurrency: number | undefined
     if (c.kind === 'serverless') {
@@ -492,6 +518,20 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       }
     }
 
+    let limiter: NodeResult['limiter']
+    if (limitOn) {
+      if (tokens !== undefined) {
+        const left = dt > 0 ? Math.min(burst, Math.max(0, tokens + (rateLimit - served) * dt)) : tokens
+        nextBucket[id] = left
+        tokens = left
+      }
+      const passShare: Record<string, number> = {}
+      for (const [src, r0] of original!) passShare[src] = r0 > 0 ? Math.min(1, ((allowed.get(src) ?? 0) / r0) * (offered > 0 ? served / offered : 0)) : 1
+      limiter = { algo: limitAlgo, level: limitAlgo === 1 ? (tokens ?? burst) : depth, max: burst, limitedByClient, passShare }
+      offered += limitedByClient // turned away for exceeding their own limit: they count as errors, like any other 429
+      dropped += limitedByClient
+    }
+
     let health: Health = 'healthy'
     if (c.kind !== 'client') {
       // A gateway that is rate limiting is doing its job: it shows as strained, not broken.
@@ -499,7 +539,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       if ((inj && capacity === 0) || (!limiting && (util >= 1 || (offered > 0 && dropped > 0.01 * offered)))) health = 'failed'
       else if (util >= 0.7 || (limiting && dropped > 0.01 * offered)) health = 'strained'
     }
-    nodes[id] = { offered, served, dropped, util, latency, queueDepth: depth, health, poolUsed, poolSize, hit, injected: injRaw, down: !!inj && capacity === 0, capacity, lagMs, staleReads, failover, blocked, cold, concurrency, conns, scaling, shards: c.kind === 'database' && shardN > 1 ? { count: shardN, hot: hotShare, even: 1 / shardN } : undefined, broker, warmth, stampede, breaker: breakerState, ...(hold > 1.01 ? { hold } : {}), ...(callFail > 0.001 ? { callTimeouts: callFail } : {}) }
+    nodes[id] = { offered, served, dropped, util, latency, queueDepth: depth, health, poolUsed, poolSize, hit, injected: injRaw, down: !!inj && capacity === 0, capacity: tokens !== undefined ? rateLimit : capacity, limiter, lagMs, staleReads, failover, blocked, cold, concurrency, conns, scaling, shards: c.kind === 'database' && shardN > 1 ? { count: shardN, hot: hotShare, even: 1 / shardN } : undefined, broker, warmth, stampede, breaker: breakerState, ...(hold > 1.01 ? { hold } : {}), ...(callFail > 0.001 ? { callTimeouts: callFail } : {}) }
   }
 
   for (const e of edges) {
@@ -617,7 +657,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   const retryFactor = dt > 0 ? prev.retryFactor + (targetRetry - prev.retryFactor) * smoothing : prev.retryFactor
 
   return {
-    state: { t, retryFactor, queueDepth: nextQueue, scale: nextScale, blockedFrac, lb: nextLb, warm: nextWarm, hold: nextHold, callFail: nextCallFail, killedAt: nextKilledAt, lag: nextLag, dlq: nextDlq, lost: nextLost, warmth: nextWarmth, flushedAt: nextFlushedAt, breaker: nextBreaker },
+    state: { t, retryFactor, queueDepth: nextQueue, scale: nextScale, blockedFrac, lb: nextLb, warm: nextWarm, hold: nextHold, callFail: nextCallFail, killedAt: nextKilledAt, lag: nextLag, bucket: nextBucket, dlq: nextDlq, lost: nextLost, warmth: nextWarmth, flushedAt: nextFlushedAt, breaker: nextBreaker },
     result: { nodes, edges: edgeRes, totals: { p50: Math.min(p50, 30000), p99: Math.min(p99, 30000), errorRate, throughput: completed * (1 - timeouts), offered: clientOffered, cost, retryFactor, blocked: blockedTotal, timeouts } },
   }
 }

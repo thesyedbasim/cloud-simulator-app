@@ -62,6 +62,9 @@ function Live({ id }: { id: string }) {
       {n.scaling && n.scaling.pending > 0 && row('Starting', `+${n.scaling.pending}, ready in ${Math.ceil(n.scaling.nextReadyIn ?? 0)} s`)}
       {kind === 'queue' && row('Depth', `${Math.round(n.queueDepth)}`)}
       {kind === 'database' && n.conns && n.conns.demand >= 1 && row(n.conns.pooled ? 'Function connections (shared)' : 'Function connections', `${Math.round(n.conns.demand)}${n.conns.pooled ? '' : ` of ${n.conns.max}`}`, !n.conns.pooled && n.conns.demand > n.conns.max)}
+      {n.limiter && n.limiter.algo === 1 && row('Tokens left', `${Math.round(n.limiter.level)} of ${Math.round(n.limiter.max)}`, n.limiter.level < n.limiter.max * 0.1)}
+      {n.limiter && n.limiter.algo === 2 && row('Waiting in bucket', `${Math.round(n.limiter.level)} of ${Math.round(n.limiter.max)}`, n.limiter.level > n.limiter.max * 0.8)}
+      {n.limiter && n.limiter.limitedByClient >= 1 && row('Over a client limit', `${Math.round(n.limiter.limitedByClient)} rps`, true)}
       {kind === 'database' && n.shards && row('Busiest shard', `${Math.round(n.shards.hot * 100)}% of traffic (${n.shards.count} shards)`, n.shards.hot > n.shards.even * 1.3)}
       {kind === 'queue' && n.broker && row('Partitions in use', `${n.broker.active} of ${n.broker.partitions} · ${n.broker.consumers} consumers`, n.broker.idle > 0)}
       {kind === 'queue' && n.broker && n.broker.hot > 1 / n.broker.partitions * 1.3 && row('Hottest partition', `${Math.round(n.broker.hot * 100)}% of messages`, true)}
@@ -161,6 +164,29 @@ function Switch({ on, onChange, label }: { on: boolean; onChange: (v: boolean) =
       className={`relative h-5 w-9 shrink-0 rounded-full border transition-colors ${on ? 'border-accent bg-accent' : 'border-line/25 bg-line/10'}`}>
       <span className={`absolute top-0.5 size-3.5 rounded-full bg-white shadow transition-all ${on ? 'left-[18px]' : 'left-0.5'}`} />
     </button>
+  )
+}
+
+const LIMIT_ALGOS = [
+  { id: 0, label: 'Fixed limit', blurb: 'Anything over the limit is turned away at once. Simple, but brief bursts that the servers could absorb are dropped.' },
+  { id: 1, label: 'Token bucket', blurb: 'A quiet period fills a bucket, and a burst may spend it on top of the limit. Allows short bursts, then holds the line.' },
+  { id: 2, label: 'Leaky bucket', blurb: 'Requests over the limit wait in a queue and are released at the limit rate, up to the burst allowance. Smooths traffic, at the price of latency.' },
+]
+
+/** How the rate limiter treats traffic over its limit. */
+function RateLimiter({ comp }: { comp: ArchComponent }) {
+  const updateConfig = useStore((s) => s.updateConfig)
+  const on = (configValue('gateway', comp.config, 'limitOn') ?? 1) >= 0.5
+  const algo = Math.round(configValue('gateway', comp.config, 'limitAlgo') ?? 0)
+  if (!on) return null
+  return (
+    <div className="flex flex-col gap-2 rounded-control border border-line/10 bg-line/[0.03] p-2.5">
+      <span className="label">Rate limiter algorithm</span>
+      <select className={select} value={algo} onChange={(e) => updateConfig(comp.id, 'limitAlgo', +e.target.value)} aria-label="Rate limiter algorithm">
+        {LIMIT_ALGOS.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
+      </select>
+      <p className="text-[11px] leading-snug text-dim">{LIMIT_ALGOS[algo]?.blurb}</p>
+    </div>
   )
 }
 
@@ -419,6 +445,7 @@ export function Inspector() {
                   <Section title="Advanced settings" open={comp.kind === 'client' || comp.kind === 'loadBalancer'}>
                     {comp.kind === 'client' && <ClientSource comp={comp} />}
                     {comp.kind === 'loadBalancer' && <Balancer comp={comp} />}
+                    {comp.kind === 'gateway' && <RateLimiter comp={comp} />}
                     {canGeoBlock(comp.kind) && <GeoRule comp={comp} />}
                     <Faults comp={comp} />
                   </Section>
