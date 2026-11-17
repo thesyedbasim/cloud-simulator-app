@@ -8,6 +8,7 @@ import { linkShortener } from '../presets/linkShortener'
 import { CONFIG_SCHEMA, DEFAULT_CONFIG, KIND_INFO, type ArchComponent, type Architecture, type ComponentKind } from './types'
 import { BOUND } from './arch'
 import { CONN_FIELDS, type ConnKey } from '../sim/balance'
+import { sanitizeExperiments } from '../sim/chaos'
 
 export const PROJECT_VERSION = 1
 export const STORAGE_KEY = 'cloudsim:project:v1'
@@ -80,7 +81,10 @@ export function parseProject(text: string): ParseResult {
     const av = Number(a.slo.availability), p99 = Number(a.slo.p99Ms)
     if (Number.isFinite(av) && Number.isFinite(p99)) slo = { availability: Math.min(0.99999, Math.max(0.9, av)), p99Ms: Math.min(10000, Math.max(20, p99)) }
   }
-  return { ok: true, arch: { name, components, connections, ...(slo ? { slo } : {}) }, warnings: [...new Set(warnings)] }
+  // saved chaos experiments: keep the ones that still make sense for this design
+  const exp = sanitizeExperiments(a.experiments, ids)
+  warnings.push(...exp.warnings)
+  return { ok: true, arch: { name, components, connections, ...(slo ? { slo } : {}), ...(exp.experiments.length ? { experiments: exp.experiments } : {}) }, warnings: [...new Set(warnings)] }
 }
 
 // ---------- browser storage (every access guarded: it can be blocked, full, or empty) ----------

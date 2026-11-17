@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { DEFAULT_CONFIG, KIND_INFO, type Architecture, type ArchComponent, type ComponentKind, type Slo } from './types'
+import { DEFAULT_CONFIG, KIND_INFO, type Architecture, type ArchComponent, type ComponentKind, type Experiment, type Slo } from './types'
 import { initialArchitecture } from './project'
 import { findFreeCell } from './arch'
 
@@ -36,6 +36,9 @@ interface UIState {
   renameProject: (name: string) => void
   /** Change the service-level targets. Not part of the undo history, and does not restart the run. */
   setSlo: (patch: Partial<Slo>) => void
+  /** Save (add or replace) a chaos experiment with the design. Not part of the undo history, and does not restart the run. */
+  saveExperiment: (exp: Experiment) => void
+  deleteExperiment: (id: string) => void
   pin: () => void
   unpin: () => void
   setReview: (open: boolean, tab?: 'review' | 'compare' | 'capacity') => void
@@ -119,6 +122,12 @@ export const useStore = create<UIState>((set, get) => ({
   },
   renameProject: (name) => set((s) => ({ architecture: { ...s.architecture, name: name.slice(0, 60) } })),
   setSlo: (patch) => set((s) => ({ architecture: { ...s.architecture, slo: { availability: 0.995, p99Ms: 500, ...s.architecture.slo, ...patch } } })),
+  saveExperiment: (exp) => set((s) => {
+    const list = s.architecture.experiments ?? []
+    const next = list.some((e) => e.id === exp.id) ? list.map((e) => (e.id === exp.id ? exp : e)) : [...list, exp].slice(-20)
+    return { architecture: { ...s.architecture, experiments: next } }
+  }),
+  deleteExperiment: (id) => set((s) => ({ architecture: { ...s.architecture, experiments: (s.architecture.experiments ?? []).filter((e) => e.id !== id) } })),
   pin: () => set((s) => ({ pinned: { arch: s.architecture, at: Date.now() } })),
   unpin: () => set({ pinned: null }),
   setReview: (open, tab) => set((s) => ({ review: { open, tab: tab ?? s.review.tab } })),

@@ -18,7 +18,13 @@ export interface Slo {
   /** The p99 latency that should not be exceeded, in ms. */
   p99Ms: number
 }
-export interface Architecture { name: string; components: ArchComponent[]; connections: Connection[]; slo?: Slo }
+/** Faults the simulation can inject (see `Injected` in sim/engine.ts). */
+export type FaultKind = 'killed' | 'slow' | 'lostInstance' | 'flushed' | 'zoneLoss' | 'bad' | 'hotKey' | 'flood'
+/** One step of a chaos experiment: at `at` seconds, apply a fault to a component, or lift whatever fault it has. */
+export interface ChaosEvent { at: number; target: string; action: FaultKind | 'restore' }
+/** A saved, replayable chaos experiment: faults scheduled on a timeline against a traffic shape. */
+export interface Experiment { id: string; name: string; events: ChaosEvent[]; shape?: 'steady' | 'spike' | 'daily' | 'flash' | 'ramp' }
+export interface Architecture { name: string; components: ArchComponent[]; connections: Connection[]; slo?: Slo; experiments?: Experiment[] }
 
 export const KIND_INFO: Record<ComponentKind, { label: string; blurb: string }> = {
   client: { label: 'Client', blurb: 'Source of all traffic into the system.' },

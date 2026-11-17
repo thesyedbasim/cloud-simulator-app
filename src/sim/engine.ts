@@ -2,7 +2,7 @@
  * Simulation engine: pure functions, no React / Pixi imports.
  * Model is documented in docs/MODEL.md. Everything here is deliberately small and approximate.
  */
-import type { ArchComponent, Architecture, ComponentKind } from '../store/types'
+import type { ArchComponent, Architecture, ComponentKind, FaultKind } from '../store/types'
 import { appCapacityPerInstance, brokerShape, dbCapacity, dbHotShare, dbShards, FUNCTION_COLD_START_MS, functionCapacity, functionDurationMs, hourlyCost, isBroker, queueDrain } from './capacity'
 import { configValue } from '../store/types'
 import { advanceEdge, backupsInUse, connValue, freshEdgeLb, HASH_BUCKETS, lbSettings, ramp, split, statusOf, type EdgeLb, type Target, type TargetStatus } from './balance'
@@ -12,7 +12,7 @@ import { fanOutLatency, shareSlowerThan } from './latency'
 export type Health = 'healthy' | 'strained' | 'failed'
 export type TrafficShape = 'steady' | 'spike' | 'daily' | 'flash' | 'ramp'
 /** killed = down; slow = 4× latency and ¼ capacity; lostInstance = one instance of a scaled-out tier dies (a lone instance = down); flushed = a cache or CDN loses everything it held and starts cold; zoneLoss = a failure zone is lost (half the instances of a scaled-out tier, rounded up; a lone instance = down); bad = a bad release (capacity is fine but a share of requests error out); hotKey = one key dominates, so most of a sharded database's or partitioned queue's traffic lands on a single shard or partition; flood = a client (a bot, a runaway job) sends several times its normal traffic. */
-export type Injected = 'killed' | 'slow' | 'lostInstance' | 'flushed' | 'zoneLoss' | 'bad' | 'hotKey' | 'flood'
+export type Injected = FaultKind
 
 export const SHAPES: { id: TrafficShape; label: string }[] = [
   { id: 'steady', label: 'Steady' },

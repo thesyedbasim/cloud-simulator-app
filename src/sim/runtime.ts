@@ -4,6 +4,8 @@ import { designChanged, useStore } from '../store/useStore'
 import { accumulate, sloOf, zeroCounters, type Counters } from './slo'
 import { analyze, type Insight } from './insight'
 import { planScenario, type ScenarioId, type ScenarioPlan } from './scenarios'
+import type { Experiment } from '../store/types'
+import { faultsAt } from './chaos'
 import { freshState, step, type EdgeResult, type Injected, type NodeResult, type StepResult, type TrafficShape, type Totals } from './engine'
 
 const DT = 0.1 // sim seconds per step
@@ -35,6 +37,8 @@ function timelineOf(): Timeline | null {
 interface History { p50: number[]; p99: number[]; err: number[]; rps: number[]; cost: number[] }
 const emptyHistory = (): History => ({ p50: [], p99: [], err: [], rps: [], cost: [] })
 
+/** A chaos experiment running live: its faults are applied on its timeline as the simulation clock passes each event. */
+interface ActiveExperiment { exp: Experiment; prevShape: TrafficShape }
 interface ActiveScenario { plan: ScenarioPlan; fired: boolean; prevShape: TrafficShape; cleared?: boolean }
 
 interface SimUI {
@@ -51,6 +55,7 @@ interface SimUI {
   insight: Insight | null
   dismissedKey: string | null
   scenario: ActiveScenario | null
+  experiment: ActiveExperiment | null
   /** null = live; otherwise the sim second being viewed while rewound. */
   scrubT: number | null
   timeline: Timeline | null
@@ -63,6 +68,8 @@ interface SimUI {
   restoreAll: () => void
   dismissInsight: () => void
   startScenario: (id: ScenarioId) => void
+  startExperiment: (exp: Experiment) => void
+  stopExperiment: () => void
   stopScenario: () => void
   toggle: () => void
   setSpeed: (s: number) => void
@@ -105,6 +112,7 @@ export const useSim = create<SimUI>((set, get) => ({
   },
   dismissedKey: null,
   scenario: null,
+  experiment: null,
   inject: (id, kind) => set((s) => ({ injected: { ...s.injected, [id]: kind } })),
   restore: (id) => set((s) => { const next = { ...s.injected }; delete next[id]; return { injected: next } }),
   restoreAll: () => set({ injected: {} }),
@@ -115,10 +123,26 @@ export const useSim = create<SimUI>((set, get) => ({
     const prev = get()
     // the scenario starts from a clean slate so there is a calm baseline before the fault lands
     resetSim()
-    set({ injected: {}, dismissedKey: null, shape: plan.shape ?? prev.shape, scenario: { plan, fired: false, prevShape: prev.scenario?.prevShape ?? prev.shape }, running: true })
+    set({ injected: {}, dismissedKey: null, shape: plan.shape ?? prev.shape, scenario: { plan, fired: false, prevShape: prev.scenario?.prevShape ?? prev.shape }, experiment: null, running: true })
     live.running = true
     toast(plan.label, { description: plan.summary })
     fireIfDue()
+  },
+  startExperiment: (exp) => {
+    if (!exp.events.length) { toast("Can't run an empty experiment", { description: 'Add at least one event first.' }); return }
+    const prev = get()
+    resetSim()
+    set({ injected: {}, dismissedKey: null, shape: exp.shape ?? prev.experiment?.prevShape ?? prev.shape, scenario: null, experiment: { exp, prevShape: prev.experiment?.prevShape ?? prev.shape }, running: true })
+    live.running = true
+    toast(`Chaos experiment: ${exp.name}`, { description: `${exp.events.length} event${exp.events.length === 1 ? '' : 's'} scheduled.` })
+    applyExperiment()
+  },
+  stopExperiment: () => {
+    const ex = get().experiment
+    if (!ex) return
+    const injected = { ...get().injected }
+    for (const e of ex.exp.events) delete injected[e.target]
+    set({ experiment: null, injected, shape: ex.exp.shape ? ex.prevShape : get().shape, dismissedKey: null })
   },
   stopScenario: () => {
     const sc = get().scenario
@@ -130,7 +154,7 @@ export const useSim = create<SimUI>((set, get) => ({
   toggle: () => { if (get().scrubT !== null) { get().goLive(); return } const running = !get().running; live.running = running; set({ running }) },
   setSpeed: (speed) => { live.speed = speed; set({ speed }) },
   setShape: (shape) => set({ shape }),
-  reset: () => { get().stopScenario(); resetSim() },
+  reset: () => { get().stopScenario(); get().stopExperiment(); resetSim() },
 }))
 
 let state = freshState()
@@ -157,6 +181,19 @@ function run(dt: number) {
   insightNow = analyze(useStore.getState().architecture, out.result)
   live.bottleneck = insightNow?.nodeId ?? null
   fireIfDue()
+  applyExperiment()
+}
+
+/** Applies the faults a running chaos experiment has scheduled so far (only the experiment's own targets are touched). */
+function applyExperiment() {
+  const ex = useSim.getState().experiment
+  if (!ex) return
+  const want = faultsAt(ex.exp.events, state.t)
+  const cur = useSim.getState().injected
+  const next = { ...cur }
+  for (const e of ex.exp.events) { if (want[e.target]) next[e.target] = want[e.target]; else delete next[e.target] }
+  const same = Object.keys(next).length === Object.keys(cur).length && Object.keys(next).every((k) => next[k] === cur[k])
+  if (!same) useSim.setState({ injected: next })
 }
 
 let insightNow: Insight | null = null
