@@ -24,7 +24,9 @@ export type FaultKind = 'killed' | 'slow' | 'lostInstance' | 'flushed' | 'zoneLo
 export interface ChaosEvent { at: number; target: string; action: FaultKind | 'restore' }
 /** A saved, replayable chaos experiment: faults scheduled on a timeline against a traffic shape. */
 export interface Experiment { id: string; name: string; events: ChaosEvent[]; shape?: 'steady' | 'spike' | 'daily' | 'flash' | 'ramp' }
-export interface Architecture { name: string; components: ArchComponent[]; connections: Connection[]; slo?: Slo; experiments?: Experiment[] }
+/** Numbers measured on the real system, entered by the user, to set beside what the model projects. All optional. */
+export interface Actual { p99Ms?: number; errorPct?: number; maxRps?: number }
+export interface Architecture { name: string; components: ArchComponent[]; connections: Connection[]; slo?: Slo; experiments?: Experiment[]; actual?: Actual }
 
 export const KIND_INFO: Record<ComponentKind, { label: string; blurb: string }> = {
   client: { label: 'Client', blurb: 'Source of all traffic into the system.' },

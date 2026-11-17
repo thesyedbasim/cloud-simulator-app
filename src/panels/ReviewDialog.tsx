@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
-import { ArrowRight, Check, Crosshair, GitCompare, Pin, PinOff, ShieldAlert, ShieldCheck, Wrench, X } from 'lucide-react'
+import { ArrowRight, Check, Crosshair, FileText, GitCompare, Pin, PinOff, ShieldAlert, ShieldCheck, Wrench, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { useStore } from '../store/useStore'
 import { SCENARIOS, type ScenarioId } from '../sim/scenarios'
@@ -11,6 +11,8 @@ import { LineChart } from './LineChart'
 import { CurveChart } from './CurveChart'
 import { findCapacity, type Headroom } from '../sim/finder'
 import { pctLabel } from '../sim/slo'
+import { compareToReality, project, type Gap } from '../sim/reality'
+import { exportReport } from '../app/projectActions'
 
 const pct = (v: number) => `${(v * 100).toFixed(v > 0 && v < 0.1 ? 1 : 0)}%`
 const ms = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(1)} s` : `${Math.round(v)} ms`)
@@ -82,6 +84,53 @@ function FixCard({ fix, onApply }: { fix: Suggestion; onApply: () => void }) {
   )
 }
 
+const VERDICT: Record<Gap['verdict'], { label: string; cls: string }> = {
+  close: { label: 'Close', cls: 'bg-healthy/15 text-healthy' },
+  optimistic: { label: 'Model too optimistic', cls: 'bg-failed/15 text-failed' },
+  pessimistic: { label: 'Model too pessimistic', cls: 'bg-strained/15 text-strained' },
+}
+
+/** Numbers measured on the real system, set beside what the model projects. */
+function RealityCheck() {
+  const arch = useStore((s) => s.architecture)
+  const setActual = useStore((s) => s.setActual)
+  const actual = useMemo(() => arch.actual ?? {}, [arch.actual])
+  const proj = useMemo(() => project(arch), [arch.components, arch.connections]) // eslint-disable-line react-hooks/exhaustive-deps
+  const gaps = useMemo(() => compareToReality(arch, actual, proj), [arch, actual, proj])
+  const set = (key: 'p99Ms' | 'errorPct' | 'maxRps', raw: string) => {
+    const next = { ...actual }
+    const v = raw.trim() === '' ? NaN : Number(raw)
+    if (Number.isFinite(v) && v >= 0) next[key] = v
+    else delete next[key]
+    setActual(Object.keys(next).length ? next : null)
+  }
+  const input = 'w-28 rounded-control border border-line/20 bg-transparent px-2 py-1.5 text-xs focus:border-accent focus:outline-none'
+  return (
+    <Section title="Reality check" hint="Optional: what you measured on the real system">
+      <div className="flex flex-wrap gap-3">
+        {([['p99Ms', 'p99 latency (ms)', proj.p99Ms], ['errorPct', 'Error rate (%)', proj.errorPct], ['maxRps', 'Max requests / s', proj.maxRps]] as const).map(([key, label, model]) => (
+          <label key={key} className="flex flex-col gap-1">
+            <span className="text-[11px] text-dim">{label}</span>
+            <input type="number" min={0} className={input} value={actual[key] ?? ''} placeholder={model === null ? 'n/a' : `model: ${Math.round((model as number) * 10) / 10}`} onChange={(e) => set(key, e.target.value)} aria-label={label} />
+          </label>
+        ))}
+      </div>
+      {gaps.length > 0 && (
+        <div className="flex flex-col gap-2">
+          {gaps.map((g) => (
+            <div key={g.metric} className="flex flex-col gap-1 rounded-control border border-line/10 px-3 py-2">
+              <div className="flex items-center gap-2"><span className="font-medium">{g.label}</span><span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${VERDICT[g.verdict].cls}`}>{VERDICT[g.verdict].label}</span>
+                <span className="data ml-auto text-xs text-dim">model {Math.round(g.projected * 10) / 10} {g.unit} · measured {Math.round(g.actual * 10) / 10} {g.unit}</span></div>
+              <p className="text-[12px] leading-snug text-dim">{g.note}</p>
+            </div>
+          ))}
+        </div>
+      )}
+      <p className="text-[11px] text-dim">A gap is information: the model is small on purpose, so it can miss things your system has. Saved with the design.</p>
+    </Section>
+  )
+}
+
 function ReviewTab() {
   const arch = useStore((s) => s.architecture)
   const { before, fixes } = useMemo(() => suggestFixes(arch), [arch])
@@ -117,6 +166,8 @@ function ReviewTab() {
           <div className="flex flex-col gap-2">{fixes.map((f) => <FixCard key={f.id} fix={f} onApply={() => apply(f.title, f.arch)} />)}</div>
         )}
       </Section>
+
+      <RealityCheck />
 
       {recovery.length > 0 && (
         <Section title="Recovery objectives" hint="RTO: how long writes fail. RPO: how much acknowledged data can be lost">
@@ -342,7 +393,8 @@ export function ReviewDialog() {
                 <button key={id} role="tab" aria-selected={tab === id} onClick={() => setReview(true, id)} className={`rounded px-3 py-1 text-xs transition-colors ${tab === id ? 'bg-accent/15 font-medium text-accent' : 'text-dim hover:text-text'}`}>{label}</button>
               ))}
             </div>
-            <Dialog.Close className="ml-auto grid size-8 place-items-center rounded-control text-dim transition-colors hover:bg-line/10 hover:text-text" aria-label="Close"><X size={16} /></Dialog.Close>
+            <button className={`${btn} ml-auto`} onClick={exportReport} title="Download this review as a Markdown report"><FileText size={13} /> Export report</button>
+            <Dialog.Close className="grid size-8 place-items-center rounded-control text-dim transition-colors hover:bg-line/10 hover:text-text" aria-label="Close"><X size={16} /></Dialog.Close>
           </header>
           <div className="overflow-y-auto px-4 py-4">{tab === 'review' ? <ReviewTab /> : tab === 'capacity' ? <CapacityTab /> : <CompareTab />}</div>
         </Dialog.Content>

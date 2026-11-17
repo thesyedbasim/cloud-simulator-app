@@ -84,7 +84,14 @@ export function parseProject(text: string): ParseResult {
   // saved chaos experiments: keep the ones that still make sense for this design
   const exp = sanitizeExperiments(a.experiments, ids)
   warnings.push(...exp.warnings)
-  return { ok: true, arch: { name, components, connections, ...(slo ? { slo } : {}), ...(exp.experiments.length ? { experiments: exp.experiments } : {}) }, warnings: [...new Set(warnings)] }
+  // measured numbers: keep the sensible ones, clamped
+  let actual: Architecture['actual']
+  if (isObj(a.actual)) {
+    const pick = (k: string, lo: number, hi: number) => { const v = Number(a.actual && (a.actual as Record<string, unknown>)[k]); return (a.actual as Record<string, unknown>)[k] !== undefined && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : undefined }
+    const p99Ms = pick('p99Ms', 1, 60000), errorPct = pick('errorPct', 0, 100), maxRps = pick('maxRps', 1, 1e7)
+    if (p99Ms !== undefined || errorPct !== undefined || maxRps !== undefined) actual = { ...(p99Ms !== undefined ? { p99Ms } : {}), ...(errorPct !== undefined ? { errorPct } : {}), ...(maxRps !== undefined ? { maxRps } : {}) }
+  }
+  return { ok: true, arch: { name, components, connections, ...(slo ? { slo } : {}), ...(exp.experiments.length ? { experiments: exp.experiments } : {}), ...(actual ? { actual } : {}) }, warnings: [...new Set(warnings)] }
 }
 
 // ---------- browser storage (every access guarded: it can be blocked, full, or empty) ----------

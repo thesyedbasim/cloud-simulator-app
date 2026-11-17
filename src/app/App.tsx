@@ -14,7 +14,7 @@ import { useTrace } from '../sim/traceStore'
 import { SloMeter } from '../panels/SloMeter'
 import { Timeline } from '../panels/Timeline'
 import { ProjectMenu } from '../panels/ProjectMenu'
-import { startAutosave, openDesign } from './projectActions'
+import { startAutosave, openDesign, openSharedFromHash } from './projectActions'
 import { PRESETS } from '../presets/index'
 import { ReviewDialog } from '../panels/ReviewDialog'
 import { Scenarios } from '../panels/Scenarios'
@@ -166,6 +166,11 @@ export default function App() {
   useShortcuts()
   useEffect(() => startSim(), [])
   useEffect(() => startAutosave(), [])
+  useEffect(() => {
+    openSharedFromHash() // a link opened in a new tab
+    window.addEventListener('hashchange', openSharedFromHash) // a link pasted into a tab that is already open
+    return () => window.removeEventListener('hashchange', openSharedFromHash)
+  }, [])
   return (
     <div className="relative h-full w-full">
       <CanvasView />

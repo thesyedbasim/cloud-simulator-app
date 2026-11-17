@@ -1,9 +1,9 @@
 import { useRef } from 'react'
 import * as Menu from '@radix-ui/react-dropdown-menu'
-import { Check, ChevronDown, Download, FilePlus2, FolderOpen, ImageDown, Upload } from 'lucide-react'
+import { Check, ChevronDown, Download, FilePlus2, FileText, FolderOpen, ImageDown, Link2, Upload } from 'lucide-react'
 import { useStore } from '../store/useStore'
 import { PRESETS } from '../presets/index'
-import { exportImage, exportJson, importFile, newBlank, openDesign } from '../app/projectActions'
+import { copyShareLink, exportImage, exportJson, exportReport, importFile, newBlank, openDesign } from '../app/projectActions'
 
 const item = 'flex cursor-pointer items-center gap-2 rounded-control px-2 py-1.5 outline-none data-[highlighted]:bg-line/10'
 
@@ -44,6 +44,8 @@ export function ProjectMenu() {
             <Menu.Item className={item} onSelect={() => fileRef.current?.click()}><Upload size={14} /> Import project file…</Menu.Item>
             <Menu.Item className={item} onSelect={exportJson}><Download size={14} /> Export project file</Menu.Item>
             <Menu.Item className={item} onSelect={() => { void exportImage() }}><ImageDown size={14} /> Export image (PNG)</Menu.Item>
+            <Menu.Item className={item} onSelect={exportReport}><FileText size={14} /> Export design report (Markdown)</Menu.Item>
+            <Menu.Item className={item} onSelect={() => { void copyShareLink() }}><Link2 size={14} /> Copy share link</Menu.Item>
           </Menu.Content>
         </Menu.Portal>
       </Menu.Root>
