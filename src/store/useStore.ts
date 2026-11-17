@@ -57,12 +57,23 @@ interface UIState {
   updateConfigs: (id: string, patch: Record<string, number>) => void
   addConnection: (from: string, to: string) => ConnectResult
   removeConnection: (id: string) => void
+  /** Change settings on a connection (weight, backup, drain) as one undo step. */
+  updateConnection: (id: string, patch: Record<string, number>) => void
+  /** Add an App Servers block next to a load balancer and connect the two. Returns the new block's id. */
+  addServerGroup: (lbId: string) => string | null
   undo: () => void
   redo: () => void
 }
 
 let counter = 100
 const uid = (p: string) => `${p}-${++counter}`
+/** Ids are handed out from a counter that restarts with the page, so skip past every id a loaded design already uses. */
+function skipUsedIds(a: Architecture) {
+  for (const id of [...a.components.map((c) => c.id), ...a.connections.map((c) => c.id)]) {
+    const n = /-(\d+)$/.exec(id)
+    if (n) counter = Math.max(counter, +n[1])
+  }
+}
 let lastEdit = { key: '', at: 0 }
 
 const commit = (s: UIState, architecture: Architecture) => ({ architecture, past: [...s.past, s.architecture].slice(-50), future: [] as Architecture[] })
@@ -73,8 +84,11 @@ function makeComponent(arch: Architecture, kind: ComponentKind, col: number, row
   return { id: uid(kind), kind, name: n > 1 ? `${KIND_INFO[kind].label} ${n}` : KIND_INFO[kind].label, position: { col, row }, config, assumed: Object.keys(config) }
 }
 
+const startArchitecture = initialArchitecture()
+skipUsedIds(startArchitecture)
+
 export const useStore = create<UIState>((set, get) => ({
-  architecture: initialArchitecture(),
+  architecture: startArchitecture,
   savedAt: null,
   past: [],
   future: [],
@@ -99,6 +113,7 @@ export const useStore = create<UIState>((set, get) => ({
   setSavedAt: (savedAt) => set({ savedAt }),
   loadArchitecture: (arch) => {
     const s = get()
+    skipUsedIds(arch)
     lastEdit = { key: '', at: 0 }
     set({ ...commit(s, arch), selectedId: null, selectedConnId: null, hoverId: null, ctx: null, pinned: null })
   },
@@ -109,6 +124,7 @@ export const useStore = create<UIState>((set, get) => ({
   setReview: (open, tab) => set((s) => ({ review: { open, tab: tab ?? s.review.tab } })),
   applyArchitecture: (arch) => {
     const s = get()
+    skipUsedIds(arch)
     lastEdit = { key: '', at: 0 }
     set({ ...commit(s, arch), ...pruneSelection(s, arch), pinned: s.pinned ?? { arch: s.architecture, at: Date.now() } })
   },
@@ -182,6 +198,21 @@ export const useStore = create<UIState>((set, get) => ({
     if (cs.some((c) => c.from === to && c.to === from)) return 'reverse'
     set(commit(s, { ...s.architecture, connections: [...cs, { id: uid('conn'), from, to }] }))
     return 'ok'
+  },
+  updateConnection: (id, patch) => {
+    const s = get()
+    set(commit(s, { ...s.architecture, connections: s.architecture.connections.map((c) => (c.id === id ? { ...c, config: { ...c.config, ...patch } } : c)) }))
+  },
+  addServerGroup: (lbId) => {
+    const s = get()
+    const lb = s.architecture.components.find((c) => c.id === lbId)
+    if (!lb) return null
+    const targets = s.architecture.connections.filter((c) => c.from === lbId).length
+    const spot = findFreeCell(s.architecture, lb.position.col + 3, lb.position.row + targets * 3 - 3) ?? findFreeCell(s.architecture, lb.position.col + 3, lb.position.row)
+    if (!spot) return null
+    const c = makeComponent(s.architecture, 'appServers', spot.col, spot.row)
+    set({ ...commit(s, { ...s.architecture, components: [...s.architecture.components, c], connections: [...s.architecture.connections, { id: uid('conn'), from: lbId, to: c.id }] }), selectedId: c.id, selectedConnId: null, rightOpen: true })
+    return c.id
   },
   removeConnection: (id) => {
     const s = get()

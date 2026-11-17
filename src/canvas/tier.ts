@@ -32,12 +32,16 @@ export function levelOf(c: ArchComponent): number {
     case 'loadBalancer': return balancerLevel(configValue('loadBalancer', cfg, 'targets') ?? 2)
     case 'queue': return queueCrates(configValue('queue', cfg, 'capacity') ?? 400) - 1
     case 'client': return clientMonitors(configValue('client', cfg, 'rps') ?? 500)
+    case 'serverless': return 1 + ((cfg.memoryMb ?? 512) >= 1024 ? 1 : 0) + ((cfg.memoryMb ?? 512) >= 2048 ? 1 : 0)
+    case 'cdn': return cacheLevel(configValue('cdn', cfg, 'hitRate') ?? 0.9)
+    case 'bucket': return 1 + ((configValue('bucket', cfg, 'storageGb') ?? 500) >= 200 ? 1 : 0) + ((configValue('bucket', cfg, 'storageGb') ?? 500) >= 2000 ? 1 : 0)
+    case 'gateway': return 1 + ((cfg.rateLimit ?? 2000) >= 2000 ? 1 : 0) + ((cfg.rateLimit ?? 2000) >= 5000 ? 1 : 0)
   }
 }
 
 /** Highest level a kind can reach, for "Level 3 of 6". */
 export const maxLevelOf = (kind: ArchComponent['kind']): number =>
-  ({ appServers: MAX_LEVEL, database: MAX_LEVEL, cache: 4, loadBalancer: 3, queue: 5, client: 4 })[kind]
+  ({ appServers: MAX_LEVEL, database: MAX_LEVEL, cache: 4, loadBalancer: 3, queue: 5, client: 4, cdn: 4, bucket: 3, gateway: 3, serverless: 3 })[kind]
 
 /** Changes whenever the look of a component would change, so the scene knows when to redraw it. */
 export function lookKey(c: ArchComponent): string {
@@ -45,6 +49,7 @@ export function lookKey(c: ArchComponent): string {
   const parts: (number | string)[] = [levelOf(c)]
   if (c.kind === 'appServers') parts.push(configValue('appServers', cfg, 'autoscale') ?? 0)
   if (c.kind === 'loadBalancer') parts.push(Math.min(6, configValue('loadBalancer', cfg, 'targets') ?? 2))
+  if (c.kind === 'database') parts.push(configValue('database', cfg, 'replicas') ?? 0)
   if (c.kind === 'queue') parts.push(queueCrates(configValue('queue', cfg, 'capacity') ?? 400))
   return `${c.kind}:${parts.join('.')}`
 }

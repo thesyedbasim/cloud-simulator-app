@@ -4,7 +4,7 @@ import { designChanged, useStore } from '../store/useStore'
 import { accumulate, sloOf, zeroCounters, type Counters } from './slo'
 import { analyze, type Insight } from './insight'
 import { planScenario, type ScenarioId, type ScenarioPlan } from './scenarios'
-import { freshState, step, type Injected, type NodeResult, type StepResult, type TrafficShape, type Totals } from './engine'
+import { freshState, step, type EdgeResult, type Injected, type NodeResult, type StepResult, type TrafficShape, type Totals } from './engine'
 
 const DT = 0.1 // sim seconds per step
 const TICK_MS = 100
@@ -44,6 +44,7 @@ interface SimUI {
   t: number
   totals: Totals | null
   nodes: Record<string, NodeResult>
+  edges: Record<string, EdgeResult>
   history: History
   nodeUtil: Record<string, number[]>
   injected: Record<string, Injected>
@@ -76,6 +77,7 @@ export const useSim = create<SimUI>((set, get) => ({
   t: 0,
   totals: null,
   nodes: {},
+  edges: {},
   history: emptyHistory(),
   nodeUtil: {},
   injected: {},
@@ -92,7 +94,7 @@ export const useSim = create<SimUI>((set, get) => ({
     live.result = snap.res
     const ins = analyze(useStore.getState().architecture, snap.res)
     live.bottleneck = ins?.nodeId ?? null
-    set({ running: false, scrubT: snap.t, t: snap.t, totals: snap.res.totals, nodes: snap.res.nodes, insight: ins, budget: snap.budget })
+    set({ running: false, scrubT: snap.t, t: snap.t, totals: snap.res.totals, nodes: snap.res.nodes, edges: snap.res.edges, insight: ins, budget: snap.budget })
   },
   goLive: () => {
     if (get().scrubT === null) return
@@ -172,7 +174,7 @@ function publish(sample: boolean) {
   if (!r) return
   const cur = useSim.getState()
   if (cur.scrubT !== null) return
-  const patch: Partial<SimUI> = { t: state.t, totals: r.totals, nodes: r.nodes, insight: insightNow, budget: counters }
+  const patch: Partial<SimUI> = { t: state.t, totals: r.totals, nodes: r.nodes, edges: r.edges, insight: insightNow, budget: counters }
   if (!insightNow && cur.dismissedKey) patch.dismissedKey = null
   if (sample) {
     const h: History = { p50: [...cur.history.p50], p99: [...cur.history.p99], err: [...cur.history.err], rps: [...cur.history.rps], cost: [...cur.history.cost] }

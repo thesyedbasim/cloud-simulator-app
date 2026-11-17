@@ -29,10 +29,10 @@ export class TracePlayer {
   readonly g = new Graphics()
   private id = -1
   private legs: Leg[] = []
-  private cols: { accent: number; ok: number; bad: number }
+  private cols: { accent: number; ok: number; bad: number; blocked: number }
 
   constructor(theme: Theme) {
-    this.cols = { accent: hex(theme.accent), ok: hex(theme.healthy), bad: hex(theme.failed) }
+    this.cols = { accent: hex(theme.accent), ok: hex(theme.healthy), bad: hex(theme.failed), blocked: hex(theme.dim) }
   }
 
   private build(ui: TraceUI, paths: Map<string, Path>, arch: Architecture) {
@@ -70,7 +70,7 @@ export class TracePlayer {
       if (!leg || e < leg.dwell0) return
       const comp = arch.components.find((c) => c.id === h.nodeId)
       if (!comp) return
-      const col = h.outcome === 'dropped' ? this.cols.bad : h.outcome === 'hit' ? this.cols.ok : this.cols.accent
+      const col = h.outcome === 'dropped' ? this.cols.bad : h.outcome === 'blocked' ? this.cols.blocked : h.outcome === 'hit' ? this.cols.ok : this.cols.accent
       const [t, r, b, l] = footprint(comp.position.col - 0.05, comp.position.row - 0.05, 2.1, 2.1)
       const current = e >= leg.dwell0 && e <= leg.dwell1
       g.poly([t.x, t.y, r.x, r.y, b.x, b.y, l.x, l.y]).fill({ color: col, alpha: current ? 0.16 : 0.07 }).stroke({ width: current ? 2 : 1.2, color: col, alpha: current ? 0.95 : 0.55 })
@@ -101,11 +101,12 @@ export class TracePlayer {
       }
     }
     const lastHop = trace.hops[last]
-    const endCol = lastHop.outcome === 'dropped' ? this.cols.bad : this.cols.ok
+    const endCol = lastHop.outcome === 'dropped' ? this.cols.bad : lastHop.outcome === 'blocked' ? this.cols.blocked : this.cols.ok
     if (finished) {
       // end marker stays until the card is closed: a tick for success, a cross for a failed request
       g.circle(p.x, y(p), 9).fill({ color: endCol })
       if (lastHop.outcome === 'dropped') g.moveTo(p.x - 3.5, y(p) - 3.5).lineTo(p.x + 3.5, y(p) + 3.5).moveTo(p.x + 3.5, y(p) - 3.5).lineTo(p.x - 3.5, y(p) + 3.5).stroke({ width: 2, color: 0xffffff })
+      else if (lastHop.outcome === 'blocked') g.moveTo(p.x - 4, y(p)).lineTo(p.x + 4, y(p)).stroke({ width: 2.5, color: 0xffffff }) // a bar: stopped on purpose, not broken
       else g.moveTo(p.x - 4, y(p)).lineTo(p.x - 1, y(p) + 3).lineTo(p.x + 4.5, y(p) - 3.5).stroke({ width: 2, color: 0xffffff })
     } else {
       const pulse = 0.5 + 0.5 * Math.sin(e / 140)

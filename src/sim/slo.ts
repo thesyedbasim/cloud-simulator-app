@@ -26,9 +26,10 @@ export interface Counters {
 }
 export const zeroCounters = (): Counters => ({ req: 0, fail: 0, okSec: 0, sec: 0 })
 
-export function accumulate(c: Counters, totals: { offered: number; errorRate: number; p99: number }, dt: number, slo: Slo): Counters {
-  if (dt <= 0 || totals.offered <= 0) return c
-  const req = totals.offered * dt
+export function accumulate(c: Counters, totals: { offered: number; errorRate: number; p99: number; blocked?: number }, dt: number, slo: Slo): Counters {
+  const legit = totals.offered - (totals.blocked ?? 0) // blocked requests were turned away on purpose
+  if (dt <= 0 || legit <= 0) return c
+  const req = legit * dt
   return { req: c.req + req, fail: c.fail + req * totals.errorRate, okSec: c.okSec + (totals.p99 <= slo.p99Ms ? dt : 0), sec: c.sec + dt }
 }
 
