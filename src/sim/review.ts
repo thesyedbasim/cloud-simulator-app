@@ -47,6 +47,39 @@ export function findSpofs(arch: Architecture): Spof[] {
   return spofs
 }
 
+// ---------- recovery objectives ----------
+
+export interface Recovery {
+  id: string
+  name: string
+  /** Seconds until the database serves writes again after losing its primary. null = someone has to restore it by hand. */
+  rtoSec: number | null
+  /** Seconds of acknowledged writes that can be lost. 0 = none. null = unbounded (there is no copy of the data). */
+  rpoSec: number | null
+  note: string
+}
+
+/**
+ * What a database promises when its primary dies, read from its settings with no simulation. With a replica, recovery takes the
+ * failover time, and the writes lost are those the replica had not yet applied (the idle replication lag) unless strong
+ * consistency makes every write wait for a replica. With no replica there is nothing to fail over to, and the model has no backups.
+ */
+export function recoveryObjectives(arch: Architecture): Recovery[] {
+  return arch.components.filter((c) => c.kind === 'database').map((c) => {
+    const replicas = Math.round(c.config.replicas ?? 0)
+    const strong = (c.config.consistency ?? 0) >= 0.5
+    if (replicas === 0) return { id: c.id, name: c.name, rtoSec: null, rpoSec: null, note: 'No replica: if the primary is lost the data has to be restored by hand, and the model has no backups.' }
+    const lag = (c.config.replLagMs ?? 50) / 1000
+    return {
+      id: c.id,
+      name: c.name,
+      rtoSec: c.config.failoverSec ?? 30,
+      rpoSec: strong ? 0 : lag,
+      note: strong ? 'Writes wait for a replica, so none are lost. They are slower, and reads all go to the primary.' : `Replicas run about ${Math.round(lag * 1000)} ms behind when idle (more under load), so that many writes can be lost.`,
+    }
+  })
+}
+
 // ---------- structural edits used by the fix search ----------
 
 const nextName = (arch: Architecture, c: ArchComponent) => `${KIND_INFO[c.kind].label} ${arch.components.filter((x) => x.kind === c.kind).length + 1}`

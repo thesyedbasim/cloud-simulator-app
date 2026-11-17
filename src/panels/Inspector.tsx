@@ -65,6 +65,8 @@ function Live({ id }: { id: string }) {
       {n.limiter && n.limiter.algo === 1 && row('Tokens left', `${Math.round(n.limiter.level)} of ${Math.round(n.limiter.max)}`, n.limiter.level < n.limiter.max * 0.1)}
       {n.limiter && n.limiter.algo === 2 && row('Waiting in bucket', `${Math.round(n.limiter.level)} of ${Math.round(n.limiter.max)}`, n.limiter.level > n.limiter.max * 0.8)}
       {n.limiter && n.limiter.limitedByClient >= 1 && row('Over a client limit', `${Math.round(n.limiter.limitedByClient)} rps`, true)}
+      {n.fanout && row('Fan-out tail', `${n.fanout.n} parallel calls: p99 of the wait ×${n.fanout.tail.toFixed(1)}`, n.fanout.tail > 1.5)}
+      {kind === 'database' && n.staleReads === 0 && n.lagMs !== undefined && row('Consistency', 'strong: no stale reads')}
       {kind === 'database' && n.shards && row('Busiest shard', `${Math.round(n.shards.hot * 100)}% of traffic (${n.shards.count} shards)`, n.shards.hot > n.shards.even * 1.3)}
       {kind === 'queue' && n.broker && row('Partitions in use', `${n.broker.active} of ${n.broker.partitions} · ${n.broker.consumers} consumers`, n.broker.idle > 0)}
       {kind === 'queue' && n.broker && n.broker.hot > 1 / n.broker.partitions * 1.3 && row('Hottest partition', `${Math.round(n.broker.hot * 100)}% of messages`, true)}

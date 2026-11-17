@@ -83,7 +83,9 @@ export function loadUnit(kind: ArchComponent['kind'], client: Pick<ArchComponent
   if (kind === 'database') {
     const read = configValue('client', client.config, 'readPct') ?? BASELINE_READ
     // Reads can be served by any replica, so the primary only carries its share of them; every write stays on the primary.
-    const replicas = target ? Math.round(configValue('database', target.config, 'replicas') ?? 0) : 0
+    // With strong consistency every read goes to the primary, so replicas take no share of them.
+    const strong = target ? (configValue('database', target.config, 'consistency') ?? 0) >= 0.5 : false
+    const replicas = target && !strong ? Math.round(configValue('database', target.config, 'replicas') ?? 0) : 0
     return (read / (1 + replicas) + (1 - read) * WRITE_COST) / BASELINE_UNIT
   }
   return 1

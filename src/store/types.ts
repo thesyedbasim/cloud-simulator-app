@@ -86,6 +86,7 @@ export const CONFIG_SCHEMA: Record<ComponentKind, ConfigField[]> = {
     { key: 'vcpu', label: 'vCPUs per instance', min: 1, max: 32, step: 1, group: 'Instance size' },
     { key: 'ramGb', label: 'Memory per instance', min: 1, max: 128, step: 1, unit: 'GB', group: 'Instance size' },
     { key: 'blocking', label: 'Workers wait on downstream calls', min: 0, max: 1, step: 1, toggle: true, optional: true, group: 'Downstream calls' },
+    { key: 'fanout', label: 'Parallel calls per request (fan-out)', min: 1, max: 100, step: 1, optional: true, group: 'Downstream calls' },
     { key: 'breaker', label: 'Circuit breaker', min: 0, max: 1, step: 1, toggle: true, optional: true, group: 'Downstream calls' },
     { key: 'breakerErrPct', label: 'Open when downstream errors exceed', min: 0.05, max: 1, step: 0.05, pct: true, showIf: 'breaker', optional: true, group: 'Downstream calls' },
     { key: 'breakerOpenSec', label: 'Stay open for', min: 2, max: 60, step: 1, unit: 's', showIf: 'breaker', optional: true, group: 'Downstream calls' },
@@ -107,6 +108,7 @@ export const CONFIG_SCHEMA: Record<ComponentKind, ConfigField[]> = {
     { key: 'hotShare', label: "Hottest shard's share of traffic (0 = even)", min: 0, max: 1, step: 0.05, pct: true, optional: true, group: 'Sharding' },
     { key: 'replicas', label: 'Read replicas', min: 0, max: 5, step: 1, optional: true, group: 'Replicas' },
     { key: 'replLagMs', label: 'Replication lag when idle', min: 10, max: 2000, step: 10, unit: 'ms', optional: true, group: 'Replicas' },
+    { key: 'consistency', label: 'Strong consistency (reads from the primary, writes wait for a replica)', min: 0, max: 1, step: 1, toggle: true, optional: true, group: 'Replicas' },
     { key: 'failoverSec', label: 'Failover time (promote a replica)', min: 5, max: 300, step: 5, unit: 's', optional: true, group: 'Replicas' },
   ],
   cache: [
@@ -151,11 +153,11 @@ export const DEFAULT_CONFIG: Record<ComponentKind, Record<string, number>> = {
 export const OPTIONAL_DEFAULTS: Partial<Record<ComponentKind, Record<string, number>>> = {
   gateway: { limitOn: 1, geoMode: 0, geoMask: 0, limitAlgo: 0, burstSec: 2, perClientOn: 0, perClientRps: 500 },
   serverless: { provisioned: 0 },
-  database: { pooler: 0, replicas: 0, replLagMs: 50, failoverSec: 30, shards: 1, hotShare: 0 },
+  database: { pooler: 0, replicas: 0, replLagMs: 50, failoverSec: 30, shards: 1, hotShare: 0, consistency: 0 },
   queue: { partitions: 0, consumers: 1, hotKeyShare: 0, poisonPct: 0, dlq: 0 },
   client: { region: 0, clientType: 0, payloadKb: 4, readPct: 0.9, weight: 1, retries: 2, backoff: 0, timeoutMs: 0 },
   loadBalancer: { geoMode: 0, geoMask: 0, policy: 0, healthCheck: 1, hcInterval: 5, hcFails: 3, slowStartSec: 0, drainSec: 0 },
-  appServers: { autoscale: 0, maxInstances: 8, warmupSec: 20, scaleUpAt: 0.7, geoMode: 0, geoMask: 0, blocking: 0, callTimeoutMs: 0, breaker: 0, breakerErrPct: 0.25, breakerOpenSec: 10 },
+  appServers: { autoscale: 0, maxInstances: 8, warmupSec: 20, scaleUpAt: 0.7, geoMode: 0, geoMask: 0, blocking: 0, callTimeoutMs: 0, fanout: 1, breaker: 0, breakerErrPct: 0.25, breakerOpenSec: 10 },
   cache: { warmSec: 30, coalesce: 0 },
   cdn: { warmSec: 30, coalesce: 0 },
 }

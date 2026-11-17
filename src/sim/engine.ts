@@ -7,7 +7,7 @@ import { appCapacityPerInstance, brokerShape, dbCapacity, dbHotShare, dbShards, 
 import { configValue } from '../store/types'
 import { advanceEdge, backupsInUse, connValue, freshEdgeLb, HASH_BUCKETS, lbSettings, ramp, split, statusOf, type EdgeLb, type Target, type TargetStatus } from './balance'
 import { BLOCK_COST, canGeoBlock, geoAllows, loadUnit, regionOf } from './geo'
-import { shareSlowerThan } from './latency'
+import { fanOutLatency, shareSlowerThan } from './latency'
 
 export type Health = 'healthy' | 'strained' | 'failed'
 export type TrafficShape = 'steady' | 'spike' | 'daily' | 'flash' | 'ramp'
@@ -126,6 +126,8 @@ export interface NodeResult {
   callTimeouts?: number
   /** Rate-limiting gateways: algorithm, what is left in the bucket (tokens, or requests waiting), requests turned away for exceeding a per-client limit, and the share of each client's requests that got through. */
   limiter?: { algo: 0 | 1 | 2; level: number; max: number; limitedByClient: number; passShare: Record<string, number> }
+  /** App tiers that make parallel downstream calls and wait for all of them: how many, and by how much waiting for the slowest stretches the p99. */
+  fanout?: { n: number; tail: number }
   /** Sharded databases: shard count, the busiest shard's share of traffic, and what an even spread would give it. */
   shards?: { count: number; hot: number; even: number }
   /** Partitioned queues: partitions, consumers doing work, consumers with nothing to read, the busiest partition's share, and dead-lettered messages. */
@@ -427,12 +429,15 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       if (reps > 0 && !failing) {
         // Replicas apply the primary's writes a little behind; the busier the primary, the further behind they fall.
         lagMs = (configValue('database', cfg, 'replLagMs') ?? 50) / (1 - Math.min(util, 0.97))
-        staleReads = (reps / (1 + reps)) * (1 - Math.exp(-lagMs / STALE_WINDOW_MS))
+        // Strong consistency reads only the primary (so nothing is stale) and makes every write wait for a replica to confirm it.
+        const strong = (configValue('database', cfg, 'consistency') ?? 0) >= 0.5
+        staleReads = strong ? 0 : (reps / (1 + reps)) * (1 - Math.exp(-lagMs / STALE_WINDOW_MS))
+        if (strong) latency += (1 - readShare) * lagMs
         nextLag[id] = lagMs
       }
       if (failover && failover.phase === 'failing' && !(id in (prev.killedAt ?? {}))) {
         // The moment the primary dies: writes it had acknowledged but not yet shipped to a replica are gone.
-        nextLost[id] = (offered - readRps) * ((prev.lag?.[id] ?? 0) / 1000)
+        nextLost[id] = (configValue('database', cfg, 'consistency') ?? 0) >= 0.5 ? 0 : (offered - readRps) * ((prev.lag?.[id] ?? 0) / 1000) // a write confirmed by a replica cannot be lost
         failover.lostWrites = nextLost[id]
       } else if (failover) nextLost[id] = prev.lost?.[id] ?? 0
       poolUsed = Math.min(poolSize, served * hotShare * (latency / 1000)) // the pool shown is the busiest shard's
@@ -629,6 +634,14 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       const rho = c.kind === 'gateway' || c.kind === 'serverless' ? 0 : Math.min(Math.max(n.util, 0), 1.2)
       p50 += w * n.latency
       p99 += w * (n.latency * (2 + 6 * rho * rho) + ((n.cold ?? 0) > 0.01 ? FUNCTION_COLD_START_MS : 0)) // a few cold requests already set the tail
+      // Fan-out: waiting for the slowest of N parallel calls stretches the tail far more than the middle.
+      const fan = c.kind === 'appServers' ? Math.round(configValue('appServers', c.config, 'fanout') ?? 1) : 1
+      if (fan > 1 && downLat[c.id] > 0) {
+        const single = fanOutLatency(1), many = fanOutLatency(fan)
+        p50 += w * downLat[c.id] * (many.p50 - single.p50)
+        p99 += w * downLat[c.id] * (many.p99 - single.p99)
+        nodes[c.id].fanout = { n: fan, tail: many.p99 / single.p99 }
+      }
     }
   }
   // Client timeouts and retry policy. A request slower than its client's timeout counts as failed, whatever the server did.

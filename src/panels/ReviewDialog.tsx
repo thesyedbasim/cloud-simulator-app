@@ -6,7 +6,7 @@ import { useStore } from '../store/useStore'
 import { SCENARIOS, type ScenarioId } from '../sim/scenarios'
 import { runScenario, type RunSummary } from '../sim/headless'
 import { suggestFixes, type Suggestion } from '../sim/fixes'
-import { addParallelCopy, diffArch, findSpofs } from '../sim/review'
+import { addParallelCopy, diffArch, findSpofs, recoveryObjectives } from '../sim/review'
 import { LineChart } from './LineChart'
 import { CurveChart } from './CurveChart'
 import { findCapacity, type Headroom } from '../sim/finder'
@@ -86,6 +86,7 @@ function ReviewTab() {
   const arch = useStore((s) => s.architecture)
   const { before, fixes } = useMemo(() => suggestFixes(arch), [arch])
   const spofs = useMemo(() => findSpofs(arch), [arch])
+  const recovery = useMemo(() => recoveryObjectives(arch), [arch])
   const { applyArchitecture, select, setReview } = useStore.getState()
   const survived = before.runs.filter((r) => !r.skipped && r.passes).length
   const total = before.runs.filter((r) => !r.skipped).length
@@ -116,6 +117,21 @@ function ReviewTab() {
           <div className="flex flex-col gap-2">{fixes.map((f) => <FixCard key={f.id} fix={f} onApply={() => apply(f.title, f.arch)} />)}</div>
         )}
       </Section>
+
+      {recovery.length > 0 && (
+        <Section title="Recovery objectives" hint="RTO: how long writes fail. RPO: how much acknowledged data can be lost">
+          <div className="overflow-hidden rounded-control border border-line/10">
+            {recovery.map((r) => (
+              <div key={r.id} className="grid grid-cols-[1fr_auto_auto] items-baseline gap-x-4 gap-y-0.5 border-b border-line/10 px-3 py-2 last:border-b-0">
+                <div className="font-medium">{r.name}</div>
+                <div className="data text-xs text-dim">RTO <span className={r.rtoSec === null ? 'text-failed' : 'text-text'}>{r.rtoSec === null ? 'manual' : `${r.rtoSec} s`}</span></div>
+                <div className="data text-xs text-dim">RPO <span className={r.rpoSec === null ? 'text-failed' : 'text-text'}>{r.rpoSec === null ? 'everything' : r.rpoSec === 0 ? 'none' : `${r.rpoSec < 1 ? Math.round(r.rpoSec * 1000) + ' ms' : r.rpoSec + ' s'}`}</span></div>
+                <p className="col-span-3 text-[11px] leading-snug text-dim">{r.note}</p>
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
 
       <Section title="Single points of failure" hint="Checked without running anything">
         {spofs.length === 0 ? (
