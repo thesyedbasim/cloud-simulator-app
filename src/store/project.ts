@@ -7,6 +7,7 @@ import { BLANK } from '../presets/index'
 import { linkShortener } from '../presets/linkShortener'
 import { CONFIG_SCHEMA, DEFAULT_CONFIG, KIND_INFO, type ArchComponent, type Architecture, type ComponentKind } from './types'
 import { BOUND } from './arch'
+import { CONN_FIELDS, type ConnKey } from '../sim/balance'
 
 export const PROJECT_VERSION = 1
 export const STORAGE_KEY = 'cloudsim:project:v1'
@@ -68,7 +69,9 @@ export function parseProject(text: string): ParseResult {
     const key = `${e.from}>${e.to}`
     if (seen.has(key) || seen.has(`${e.to}>${e.from}`)) { warnings.push('Skipped a duplicate connection.'); continue }
     seen.add(key)
-    connections.push({ id: e.id, from: e.from, to: e.to })
+    const cfg: Record<string, number> = {}
+    if (isObj(e.config)) for (const k of Object.keys(CONN_FIELDS) as ConnKey[]) { const v = Number(e.config[k]); if (e.config[k] !== undefined && Number.isFinite(v)) cfg[k] = Math.min(CONN_FIELDS[k].max, Math.max(CONN_FIELDS[k].min, v)) }
+    connections.push({ id: e.id, from: e.from, to: e.to, ...(Object.keys(cfg).length ? { config: cfg } : {}) })
   }
   const name = typeof a.name === 'string' && a.name.trim() ? a.name.trim().slice(0, 60) : 'Imported design'
   // optional service-level targets: keep them if sensible, clamp them into range

@@ -1,4 +1,5 @@
 import { Container, Graphics, Polygon, Text } from 'pixi.js'
+import { GEO_OFF, geoModeOf, REGIONS, regionOf } from '../sim/geo'
 import { gridToScreen, footprint } from '../lib/iso'
 import type { Theme } from '../lib/theme'
 import { configValue, type ArchComponent } from '../store/types'
@@ -14,7 +15,7 @@ export class ComponentView extends Container {
   private selected = false
   private link: 'none' | 'candidate' | 'target' = 'none'
   private appearing = false
-  private fx = new Graphics() // indicators painted ON the body (LEDs, pool gauge, cracks): float with it
+  private fx = new Graphics() // indicators painted ON the body (LEDs, pool gauge, failure badge): float with it
   private fxStatic = new Graphics() // load bar, queue-depth column: never move
   private fxBelow = new Graphics()
   private stat = new Text({ text: '', style: { fontFamily: 'IBM Plex Mono', fontSize: 8, fill: '#5a7089', letterSpacing: 0.4 } })
@@ -126,6 +127,12 @@ export class ComponentView extends Container {
       case 'database': {
         const cx = col + 1, cy = row + 1
         const l = gridToScreen(cx, cy)
+        // read replicas: smaller copies standing behind the primary, one per replica
+        const replicas = Math.round(configValue('database', cfg, 'replicas') ?? 0)
+        for (let i = replicas - 1; i >= 0; i--) {
+          const p = gridToScreen(col + 1.85, row + 0.15 + i * 0.36)
+          isoCylinder(g, p.x, p.y, 10, 5, 16, c)
+        }
         // more vCPUs: the cylinder grows taller, one more band per level
         const RX = 25.6, RY = 12.8, HT = 24 + (L - 1) * 14
         const side = solid(c, 0.16), cap = solid(c, 0.06)
@@ -153,6 +160,49 @@ export class ComponentView extends Container {
         // a bigger cache (higher hit rate) has more shelves
         isoBox(g, col + 0.2, row + 0.3, 1.6, 1.4, 6, c, 0, 0.12)
         for (let k = 0; k < L - 1; k++) isoBox(g, col + 0.2, row + 0.3, 1.6, 1.4, 2, c, 10 + k * 12, 0.1)
+        break
+      }
+      case 'serverless': {
+        // a lightning bolt on a small pad: code that runs on demand. More memory, a bigger bolt.
+        const l = gridToScreen(col + 1, row + 1)
+        isoCylinder(g, l.x, l.y, 22, 11, 5, c)
+        const k = 0.8 + L * 0.2
+        const pts = [[6, -50], [-11, -26], [-1, -26], [-8, -8], [12, -32], [2, -32]].flatMap(([dx, dy]) => [l.x + dx * k, l.y + dy * k - 4])
+        g.poly(pts).fill({ color: acc, alpha: 0.9 }).stroke({ width: 1.2, color: c })
+        break
+      }
+      case 'cdn': {
+        // an edge site with a globe on top; a higher hit rate makes a bigger globe
+        const l = gridToScreen(col + 1, row + 1)
+        isoCylinder(g, l.x, l.y, 28, 14, 7, c)
+        const r = 9 + L * 2.5
+        const top = l.y - 10 - r
+        g.circle(l.x, top, r).fill({ color: solid(c, 0.1) }).stroke({ width: 1, color: c, alpha: 0.9 })
+        g.ellipse(l.x, top, r * 0.45, r).stroke({ width: 1, color: c, alpha: 0.5 })
+        g.ellipse(l.x, top, r, r * 0.35).stroke({ width: 1.2, color: acc, alpha: 0.85 })
+        break
+      }
+      case 'bucket': {
+        // a tapered bucket; more stored data makes it taller
+        const l = gridToScreen(col + 1, row + 1)
+        const H = 20 + L * 6, rb = 17, rt = 24
+        const stroke = { width: 1, color: c, alpha: 0.9 }
+        g.ellipse(l.x, l.y, rb, rb * 0.5).fill({ color: solid(c, 0.16) }).stroke(stroke)
+        g.poly([l.x - rb, l.y, l.x - rt, l.y - H, l.x + rt, l.y - H, l.x + rb, l.y]).fill({ color: solid(c, 0.16) })
+        g.moveTo(l.x - rb, l.y).lineTo(l.x - rt, l.y - H).moveTo(l.x + rb, l.y).lineTo(l.x + rt, l.y - H).stroke(stroke)
+        g.moveTo(l.x - rb, l.y)
+        for (let k = 1; k <= 24; k++) { const a = Math.PI * (k / 24); g.lineTo(l.x - Math.cos(a) * rb, l.y + Math.sin(a) * rb * 0.5) }
+        g.stroke(stroke)
+        g.ellipse(l.x, l.y - H, rt, rt * 0.5).fill({ color: solid(c, 0.05) }).stroke({ width: 1, color: c })
+        g.ellipse(l.x, l.y - H, rt * 0.8, rt * 0.4).stroke({ width: 1, color: acc, alpha: 0.6 })
+        break
+      }
+      case 'gateway': {
+        // two pillars and a lintel across the road: every request passes through the gate
+        const h = 24 + (L - 1) * 7
+        isoBox(g, col + 0.6, row + 0.15, 0.8, 0.4, h, c, 0, 0.18)
+        isoBox(g, col + 0.6, row + 1.45, 0.8, 0.4, h, c, 0, 0.18)
+        isoBox(g, col + 0.6, row + 0.15, 0.8, 1.7, 6, c, h, 0.12)
         break
       }
       case 'queue': {
@@ -210,6 +260,9 @@ export class ComponentView extends Container {
     this.tag.visible = false
     this.addChild(this.tag)
   }
+
+  /** Show just the drawing (no label, stats or indicators), for the palette. */
+  iconOnly() { for (const ch of this.children) ch.visible = ch === this.body }
 
   setBottleneck(on: boolean) {
     this.bottleneck = on
@@ -326,7 +379,7 @@ export class ComponentView extends Container {
     this.body.scale.set(1 + this.hoverGlow * 0.0)
   }
 
-  /** On-object state: status ring, load bar, per-kind gauges, cracks when failed. */
+  /** On-object state: status ring, load bar, per-kind gauges, an X badge when failed. */
   private drawState(now: number) {
     const n = this.node
     const fx = this.fx.clear()
@@ -404,13 +457,13 @@ export class ComponentView extends Container {
       default: break
     }
 
-    // cracks on a failed component
+    // a failed component gets a red "X" badge above it, so failure reads at a glance
     if (failed) {
       const c = gridToScreen(col + 1, row + 1)
-      const top = c.y - 24
-      fx.moveTo(c.x - 12, top - 2).lineTo(c.x - 4, top + 5).lineTo(c.x - 9, top + 11).lineTo(c.x + 1, top + 18)
-        .moveTo(c.x + 9, top - 4).lineTo(c.x + 4, top + 3).lineTo(c.x + 12, top + 9)
-        .stroke({ width: 1.5, color: t.failed })
+      const bb = this.body.getLocalBounds()
+      const top = bb.minY + bb.height * 0.45
+      fx.circle(c.x, top, 9).fill({ color: t.failed }).stroke({ width: 1.5, color: '#ffffff' })
+      fx.moveTo(c.x - 3.5, top - 3.5).lineTo(c.x + 3.5, top + 3.5).moveTo(c.x + 3.5, top - 3.5).lineTo(c.x - 3.5, top + 3.5).stroke({ width: 1.8, color: '#ffffff', cap: 'round' })
     }
   }
 
@@ -449,8 +502,9 @@ export class ComponentView extends Container {
   private statText(n: NodeResult): string {
     if (n.down) return 'DOWN'
     switch (this.comp.kind) {
-      case 'client': return `${Math.round(n.offered)} RPS`
-      case 'cache': return n.offered > 0 ? `HIT ${Math.round(n.hit * 100)}%` : 'IDLE'
+      case 'client': return `${Math.round(n.offered)} RPS · ${REGIONS[regionOf(this.comp)].short}`
+      case 'cache':
+      case 'cdn': return n.offered > 0 ? `HIT ${Math.round(n.hit * 100)}%` : 'IDLE'
       case 'queue': return `DEPTH ${Math.round(n.queueDepth)}`
       default: {
         if (n.down) return 'DOWN'
@@ -458,7 +512,11 @@ export class ComponentView extends Container {
         if (n.scaling) return `${n.scaling.active}${n.scaling.pending ? `+${n.scaling.pending}` : ''}/${n.scaling.max} · ${pct}`
         if (n.injected === 'slow') return `SLOW ${pct}`
         if (n.injected === 'lostInstance') return `-1 NODE ${pct}`
-        return n.offered > 0 ? pct : 'IDLE'
+        const blocked = n.blocked >= 0.5 ? ` · ${Math.round(n.blocked)} BLOCKED` : geoModeOf(this.comp) !== GEO_OFF ? ' · GEO' : ''
+        const replicasTxt = this.comp.kind === 'database' && (configValue('database', this.comp.config, 'replicas') ?? 0) > 0 ? ` · +${Math.round(configValue('database', this.comp.config, 'replicas') ?? 0)}R` : ''
+        const coldTxt = this.comp.kind === 'serverless' && (n.cold ?? 0) > 0.01 ? ` · COLD ${Math.round((n.cold ?? 0) * 100)}%` : ''
+        const limiting = this.comp.kind === 'gateway' && n.dropped >= 1 ? ' · LIMITING' : ''
+        return (n.offered > 0 ? pct : 'IDLE') + replicasTxt + limiting + coldTxt + blocked
       }
     }
   }

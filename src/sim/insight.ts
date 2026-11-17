@@ -68,7 +68,10 @@ function why(c: ArchComponent, n: NodeResult): { title: string; reasons: string[
     }
     case 'database': {
       const d = dbCapacity(cfg)
-      if (n.poolSize > 0 && n.poolUsed >= n.poolSize * 0.9) {
+      if (n.conns && !n.conns.pooled && n.conns.demand > n.conns.max) {
+        reasons.push(`Function instances are holding about ${n0(n.conns.demand)} connections, but the database allows only ${n0(n.conns.max)}, so requests without a connection are refused.`)
+        hint = 'Turn on the connection pooler so many function instances share a few connections, or raise the connection pool.'
+      } else if (n.poolSize > 0 && n.poolUsed >= n.poolSize * 0.9) {
         reasons.push(`The connection pool is exhausted: ${n.poolUsed.toFixed(0)} of ${n.poolSize} connections are in use because each query now takes about ${n0(n.latency)} ms.`)
         hint = 'Queries are holding connections too long. Reduce the load on the database (a cache helps), or scale it up.'
       } else {

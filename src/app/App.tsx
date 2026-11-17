@@ -53,7 +53,7 @@ function TopBar() {
       <div className="ml-auto flex items-center gap-3">
         <SimControls />
         <Scenarios />
-        <button onClick={() => useTrace.getState().start()} title="Trace one request through the system (or click a moving dot)" className="flex items-center gap-1.5 rounded-control border border-line/15 px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-line/10 active:scale-95"><Route size={13} className="text-accent" /> <span className="hidden lg:inline">Trace</span></button>
+        <button onClick={() => useTrace.getState().start()} title="Trace one request through the system (or Shift-click a moving dot)" className="flex items-center gap-1.5 rounded-control border border-line/15 px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-line/10 active:scale-95"><Route size={13} className="text-accent" /> <span className="hidden lg:inline">Trace</span></button>
         <ReviewButton />
         <span className="h-5 w-px bg-line/15" />
         <div className="flex items-center gap-1">
@@ -103,6 +103,7 @@ function MetricsStrip() {
       <Metric label="p50" spark={h.p50}><NumberFlow value={p50} format={whole} /> ms</Metric>
       <Metric label="p99" tone={p99 > 1000 ? 'bad' : p99 > 400 ? 'warn' : 'ok'} spark={h.p99}><NumberFlow value={p99} format={whole} /> ms</Metric>
       <Metric label="err" tone={err > 5 ? 'bad' : err > 1 ? 'warn' : 'ok'} spark={h.err}><NumberFlow value={err} format={{ maximumFractionDigits: 1, minimumFractionDigits: 1 }} />%</Metric>
+      {(totals?.blocked ?? 0) >= 0.5 && <Metric label="blocked"><NumberFlow value={totals?.blocked ?? 0} format={whole} /> rps</Metric>}
       <Metric label="rps" spark={h.rps}><NumberFlow value={totals?.throughput ?? 0} format={whole} /></Metric>
       <Metric label="cost" spark={h.cost}>~$<NumberFlow value={totals?.cost ?? 0} format={{ minimumFractionDigits: 2, maximumFractionDigits: 2 }} />/hr <span className="text-[10px] text-dim">(est.)</span></Metric>
       <span className="ml-auto" />

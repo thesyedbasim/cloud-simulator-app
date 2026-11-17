@@ -7,6 +7,7 @@ import type { Architecture, ComponentKind } from '../store/types'
 import { ComponentView } from './ComponentView'
 import { lookKey } from './tier'
 import { connectionPts, isoPath } from './drawing'
+import { EdgeLabels } from './EdgeLabels'
 import { Particles, makePath, type Path } from './Particles'
 import { live } from '../sim/runtime'
 import { useTrace } from '../sim/traceStore'
@@ -23,7 +24,7 @@ export interface SceneHandlers {
   onMove: (id: string, col: number, row: number) => void
   onConnect: (from: string, to: string) => void
   onConnectMode: (on: boolean) => void
-  /** The user clicked a moving dot on this connection: trace a request that travels over it. */
+  /** The user Shift-clicked a moving dot on this connection: trace a request that travels over it. */
   onTrace: (edgeId: string) => void
 }
 
@@ -34,6 +35,9 @@ interface DragState { id: string; view: ComponentView; grab: Pt; start: Cell; mo
 interface ConnectState { from: string; target: string | null; sticky: boolean; press: Pt }
 interface Ripple { g: Graphics; age: number }
 
+/** How far (screen pixels) from a connection line a click still counts as on it. */
+const CONN_HIT_PX = 16
+
 export class Scene {
   insets: () => { leftOpen: boolean; rightOpen: boolean } = () => ({ leftOpen: true, rightOpen: true })
   app!: Application
@@ -41,6 +45,7 @@ export class Scene {
   private t!: Theme
   private host: HTMLElement
   private h: SceneHandlers
+  private edgeLabels!: EdgeLabels
   private arch: Architecture = { name: '', components: [], connections: [] }
   private views = new Map<string, ComponentView>()
   private world = new Container()
@@ -92,8 +97,11 @@ export class Scene {
     this.conns.zIndex = -1000
     this.world.addChild(this.conns)
     this.particles = new Particles(this.t)
+    this.edgeLabels = new EdgeLabels(this.t)
     this.particles.g.zIndex = -900 // above connection lines, below components so traffic flows "into" them
     this.world.addChild(this.particles.g)
+    this.edgeLabels.zIndex = -850
+    this.world.addChild(this.edgeLabels)
     vp.addChild(this.world)
     this.player = new TracePlayer(this.t)
     vp.addChild(this.player.g) // the traced request rides above the components
@@ -110,7 +118,7 @@ export class Scene {
       const id = this.componentAt(this.viewport.toWorld(e.global))
       if (id) { e.stopPropagation(); this.h.onContextMenu(id, e.client.x, e.client.y) }
     })
-    vp.on('clicked', (e) => this.onClicked(e.world))
+    vp.on('clicked', (e) => this.onClicked(e.world, !!(e.event as FederatedPointerEvent).shiftKey))
     vp.on('pointermove', (e) => this.onMove(e))
     vp.on('pointerup', (e) => this.onUp(e))
     vp.on('pointerupoutside', (e) => this.onUp(e))
@@ -123,6 +131,7 @@ export class Scene {
       this.views.forEach((v, id) => { v.setNode(res?.nodes[id]); v.setBottleneck(id === live.bottleneck); v.handle.scale.set(inv); v.tick() })
       this.ghost?.tick()
       this.player.update(useTrace.getState(), this.paths, this.arch)
+      this.edgeLabels.update(this.arch, this.paths, res)
       this.particles.update(Math.min(0.05, app.ticker.deltaMS / 1000), this.paths, res, live.running, live.speed)
       this.tickRipples()
     })
@@ -396,7 +405,7 @@ export class Scene {
         this.app.renderer.events.rootBoundary.cursor = 'crosshair' // Pixi applies this after our handler runs
       }
       this.views.forEach((v, id) => v.setHandleState(id === overHandle ? 'hover' : 'idle'))
-      this.viewport.cursor = !overHandle && !this.hoverId && this.particles.hit(p, 8 / this.viewport.scale.x) ? 'pointer' : 'default'
+      this.viewport.cursor = !overHandle && !this.hoverId && ((e.shiftKey && this.particles.hit(p, 8 / this.viewport.scale.x)) || this.connAt(p)) ? 'pointer' : 'default'
     }
 
     const d = this.drag
@@ -491,22 +500,28 @@ export class Scene {
     }
   }
 
-  private onClicked(world: Pt) {
-    // a press that began on a component already selected it; don't let the click deselect
-    if (this.downOnComp) { this.downOnComp = false; return }
-    // a click on a moving dot follows that request; it takes priority over selecting the line underneath
-    const edge = this.particles.hit(world, 8 / this.viewport.scale.x)
-    if (edge) { this.h.onTrace(edge); return }
-    const tol = 8 / this.viewport.scale.x
+  /** The connection nearest to a point, within a generous margin either side of the line so it is easy to hit. */
+  private connAt(world: Pt): string | null {
+    const tol = CONN_HIT_PX / this.viewport.scale.x
+    let best: string | null = null, bestD = tol
     for (const cn of this.arch.connections) {
       const a = this.arch.components.find((c) => c.id === cn.from), b = this.arch.components.find((c) => c.id === cn.to)
       if (!a || !b) continue
       const pts = connectionPts(a.position, b.position)
-      if (distToSegment(world, pts[0], pts[1]) < tol || distToSegment(world, pts[1], pts[2]) < tol) {
-        this.h.onSelectConn(cn.id)
-        return
-      }
+      const d = Math.min(distToSegment(world, pts[0], pts[1]), distToSegment(world, pts[1], pts[2]))
+      if (d < bestD) { bestD = d; best = cn.id }
     }
+    return best
+  }
+
+  private onClicked(world: Pt, shift: boolean) {
+    // a press that began on a component already selected it; don't let the click deselect
+    if (this.downOnComp) { this.downOnComp = false; return }
+    // tracing a request needs Shift, so a plain click on a busy line always selects the connection
+    const edge = shift ? this.particles.hit(world, 8 / this.viewport.scale.x) : null
+    if (edge) { this.h.onTrace(edge); return }
+    const hit = this.connAt(world)
+    if (hit) { this.h.onSelectConn(hit); return }
     this.h.onSelect(null)
   }
 

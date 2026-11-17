@@ -1,4 +1,6 @@
 /** Static design review: no simulation needed. Single points of failure, and a readable diff between two designs. */
+import { CONN_FIELDS, POLICIES, connValue, lbSettings, type ConnKey } from './balance'
+import { describeGeo, REGIONS, regionOf } from './geo'
 import { CONFIG_SCHEMA, KIND_INFO, type ArchComponent, type Architecture } from '../store/types'
 import { findFreeCell } from '../store/arch'
 
@@ -106,9 +108,27 @@ export function diffArch(a: Architecture, b: Architecture): Change[] {
   for (const c of b.components) {
     const p = am.get(c.id)
     if (!p) continue
+    const rp = regionOf(p), rc = regionOf(c)
+    if (c.kind === 'client' && rp !== rc) out.push({ kind: 'changed', text: `${c.name}: region ${REGIONS[rp].label} → ${REGIONS[rc].label}` })
+    if (c.kind === 'loadBalancer') {
+      const lp = lbSettings(p).policy, lc = lbSettings(c).policy
+      if (lp !== lc) out.push({ kind: 'changed', text: `${c.name}: balancing ${POLICIES[lp].label} → ${POLICIES[lc].label}` })
+    }
+    const gp = describeGeo(p), gc = describeGeo(c)
+    if (gp !== gc) out.push({ kind: 'changed', text: `${c.name}: geo rule ${gp ? gp.toLowerCase() : 'off'} → ${gc ? gc.toLowerCase() : 'off'}` })
     for (const f of CONFIG_SCHEMA[c.kind]) {
+      if (f.hidden) continue
       const x = p.config[f.key], y = c.config[f.key]
       if (x !== y && x !== undefined && y !== undefined) out.push({ kind: 'changed', text: `${c.name}: ${f.label} ${fmtVal(c.kind, f.key, x)} → ${fmtVal(c.kind, f.key, y)}` })
+    }
+  }
+  const bConn = new Map(b.connections.map((e) => [e.id, e]))
+  for (const e of a.connections) {
+    const n = bConn.get(e.id)
+    if (!n) continue
+    for (const k of Object.keys(CONN_FIELDS) as ConnKey[]) {
+      const x = connValue(e, k), y = connValue(n, k)
+      if (x !== y) out.push({ kind: 'changed', text: `${am.get(e.from)?.name ?? '?'} → ${am.get(e.to)?.name ?? '?'}: ${CONN_FIELDS[k].label.toLowerCase()} ${x} → ${y}` })
     }
   }
   const key = (e: { from: string; to: string }) => `${e.from}>${e.to}`

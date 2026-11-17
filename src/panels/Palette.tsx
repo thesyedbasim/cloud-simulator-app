@@ -4,10 +4,29 @@ import { useStore } from '../store/useStore'
 import { KIND_INFO, type ComponentKind } from '../store/types'
 import { addAtCenter } from '../canvas/CanvasView'
 import { slide } from './ui'
+import { useEffect, useState } from 'react'
+import { renderPaletteIcons } from '../canvas/paletteIcons'
 
 const blank = (() => { const i = new Image(); i.src = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=='; return i })()
 
+const KINDS = Object.keys(KIND_INFO) as ComponentKind[]
+
+/** Pictures of the components exactly as the canvas draws them; redrawn when the light/dark theme changes. */
+function useIcons() {
+  const [icons, setIcons] = useState<Partial<Record<ComponentKind, string>>>({})
+  useEffect(() => {
+    let alive = true
+    const run = () => { document.fonts.ready.then(() => renderPaletteIcons(KINDS)).then((i) => { if (alive) setIcons(i) }).catch(() => {}) }
+    run()
+    const mo = new MutationObserver(run)
+    mo.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'data-theme', 'style'] })
+    return () => { alive = false; mo.disconnect() }
+  }, [])
+  return icons
+}
+
 export function Palette() {
+  const icons = useIcons()
   const open = useStore((s) => s.leftOpen)
   const setDragKind = useStore((s) => s.setDragKind)
   return (
@@ -28,11 +47,11 @@ export function Palette() {
               }}
               onDragEnd={() => setDragKind(null)}
               onClick={() => addAtCenter(k)}
-              className="group flex cursor-grab items-start gap-1 rounded-control border border-transparent px-1 py-2 text-left transition-colors hover:border-line/20 hover:bg-line/5 active:scale-[0.97] active:cursor-grabbing"
+              className="group flex cursor-grab items-center gap-1.5 rounded-control border border-transparent px-1.5 py-1.5 text-left transition-colors hover:border-line/20 hover:bg-line/5 active:scale-[0.97] active:cursor-grabbing"
             >
-              <GripVertical size={14} className="mt-0.5 shrink-0 text-dim opacity-0 transition-opacity group-hover:opacity-100" />
-              <span>
-                <span className="block font-medium">{KIND_INFO[k].label}</span>
+              <span className="flex h-8 w-9 shrink-0 items-center justify-center">{icons[k] && <img src={icons[k]} alt="" draggable={false} className="max-h-full max-w-full object-contain" />}</span>
+              <span className="min-w-0 flex-1">
+                <span className="flex items-center justify-between font-medium">{KIND_INFO[k].label}<GripVertical size={12} className="shrink-0 text-dim opacity-0 transition-opacity group-hover:opacity-100" /></span>
                 <span className="block text-[11px] leading-snug text-dim">{KIND_INFO[k].blurb}</span>
               </span>
             </button>
