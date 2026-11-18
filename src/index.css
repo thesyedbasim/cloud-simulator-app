@@ -50,7 +50,9 @@ button:focus-visible { outline: 2px solid var(--bp-accent); outline-offset: 2px;
   * { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }
 
-@keyframes dlgIn { from { opacity: 0; transform: translate(-50%, calc(-50% + 8px)) scale(0.985); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); } }
+/* Dialogs are centred with Tailwind's `translate` property (-translate-x/y-1/2), which composes with `transform`.
+   This animates only the small slide and scale, so the two never fight and the dialog opens already centred. */
+@keyframes dlgIn { from { opacity: 0; transform: translateY(8px) scale(0.985); } to { opacity: 1; transform: none; } }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 .dlg-in { animation: dlgIn var(--dur-base) var(--ease-out); }
 .fade-in { animation: fadeIn var(--dur-base) var(--ease-out); }

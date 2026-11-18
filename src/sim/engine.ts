@@ -6,7 +6,8 @@ import type { ArchComponent, Architecture, ComponentKind, FaultKind } from '../s
 import { appCapacityPerInstance, brokerShape, dbCapacity, dbHotShare, dbShards, FUNCTION_COLD_START_MS, functionCapacity, functionDurationMs, hourlyCost, isBroker, queueDrain } from './capacity'
 import { configValue } from '../store/types'
 import { advanceEdge, backupsInUse, connValue, freshEdgeLb, HASH_BUCKETS, lbSettings, ramp, split, statusOf, type EdgeLb, type Target, type TargetStatus } from './balance'
-import { BLOCK_COST, canGeoBlock, geoAllows, loadUnit, regionOf } from './geo'
+import { hopNetwork, effectiveRegions, NET_TAIL } from './network'
+import { BASELINE_READ, BLOCK_COST, canGeoBlock, geoAllows, loadUnit, regionOf } from './geo'
 import { fanOutLatency, shareSlowerThan } from './latency'
 
 export type Health = 'healthy' | 'strained' | 'failed'
@@ -107,7 +108,10 @@ export interface NodeResult {
   health: Health
   poolUsed: number
   poolSize: number
+  /** Caches and CDNs: the share of ALL requests reaching this node that it answered. Writes are never answered from a cache, so this falls as the write share rises. */
   hit: number
+  /** Caches and CDNs: the hit rate on reads alone. */
+  readHit?: number
   injected?: Injected
   /** Capacity is zero because of an injected fault. */
   down: boolean
@@ -148,6 +152,9 @@ export interface NodeResult {
 export interface EdgeResult {
   rps: number
   dropFrac: number
+  /** Network time over this connection when its ends are in different regions: the round trip, and moving the response. Both 0 within a region. */
+  rttMs: number
+  transferMs: number
   /** Only on connections that leave a load balancer. */
   lb?: { status: TargetStatus; share: number; bySource: Record<string, number> }
 }
@@ -155,6 +162,8 @@ export interface EdgeResult {
 export interface Totals { p50: number; p99: number; errorRate: number; throughput: number; offered: number; cost: number; retryFactor: number; blocked: number
   /** Share of requests that ran past their client's timeout. Already included in `errorRate`. */
   timeouts: number
+  /** The part of the median that is network time between regions (already included in `p50`). */
+  netMs: number
 }
 export interface StepResult { nodes: Record<string, NodeResult>; edges: Record<string, EdgeResult>; totals: Totals }
 
@@ -239,6 +248,8 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   const nextLost: Record<string, number> = {}
   const blockedBySrc: Record<string, number> = {}
   const mult = trafficMultiplier(opts.shape, t)
+  const regions = effectiveRegions(arch)
+  const avgPayload = new Map<string, number>() // average response size (KB) of what each node handles, for transfer time
   let completed = 0
   let cost = 0
 
@@ -288,13 +299,18 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
     }
     let offered = 0
     let readRps = 0
+    let payloadSum = 0
     let unitLoad = 0 // capacity units: a request from a heavy or write-heavy client counts for more
+    const fracOf = new Map<string, number>() // the share of each source's requests that are reads
     for (const [src, rps] of allowed) {
       offered += rps
       const sc = byId.get(src)
+      fracOf.set(src, sc ? (configValue('client', sc.config, 'readPct') ?? 0.9) : 1)
       unitLoad += rps * (sc ? loadUnit(c.kind, sc, cEff) : 1)
-      readRps += sc ? rps * (configValue('client', sc.config, 'readPct') ?? 0.9) : rps
+      readRps += sc ? rps * (fracOf.get(src) ?? 1) : rps
+      payloadSum += rps * (sc ? (configValue('client', sc.config, 'payloadKb') ?? 4) : 4)
     }
+    avgPayload.set(id, offered > 0 ? payloadSum / offered : 4)
     const unit = offered > 0 ? unitLoad / offered : 1
     const blockLoad = canGeoBlock(c.kind) ? blocked * BLOCK_COST[c.kind as keyof typeof BLOCK_COST] : 0
 
@@ -458,6 +474,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
 
     let forward = served
     let hit = 0
+    let readHit: number | undefined
     let warmth: number | undefined
     let stampede: number | undefined
     if (c.kind === 'cache' || c.kind === 'cdn') {
@@ -469,13 +486,22 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       w = Math.min(1, w + (dt > 0 ? dt / (configValue(c.kind, cfg, 'warmSec') ?? 30) : 0))
       if (w < 1) nextWarmth[id] = w
       warmth = w
-      hit = (cfg.hitRate ?? 0.8) * w
+      // The configured hit rate is what the cache achieves on the standard 90% read mix, so a design that has not
+      // touched its read/write ratio behaves as it always did. What it answers is reads only, so its hit rate on
+      // reads is that figure spread over the reads alone, and a write-heavier mix answers proportionally less.
+      readHit = Math.min(1, (cfg.hitRate ?? 0.8) / BASELINE_READ) * w
       stampede = (configValue(c.kind, cfg, 'coalesce') ?? 0) >= 0.5 ? 1 : 1 + STAMPEDE_MAX * (1 - w)
+      // Only reads can be answered from a cache; every write goes through to the origin.
+      hit = readShare * readHit
       completed += served * hit
-      forward = served * (1 - hit) * stampede // duplicate loads for the same missing key add to the misses
+      forward = served * (readShare * (1 - readHit) * stampede + (1 - readShare)) // duplicate loads for the same missing key add to the misses
     }
     const o = outs.get(id) ?? []
-    const passed = offered > 0 ? forward / offered : 0 // every source loses the same share to drops and cache hits
+    const passed = offered > 0 ? forward / offered : 0 // every source loses the same share to drops (and to cache hits, for a node that is not a cache)
+    const isCache = c.kind === 'cache' || c.kind === 'cdn'
+    const servedFrac = offered > 0 ? served / offered : 0
+    const passedRead = isCache ? servedFrac * (1 - (readHit ?? 0)) * (stampede ?? 1) : passed // a cache answers some reads...
+    const passedWrite = isCache ? servedFrac : passed // ...and no writes
     if (o.length === 0) completed += forward
     else {
       // Share each source's traffic between the outgoing connections. Only a load balancer does anything but split evenly.
@@ -511,11 +537,15 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       o.forEach((e, i) => {
         const bySource: Record<string, number> = {}
         let rps = 0
-        for (const [src, r] of allowed) { const v = r * passed * fractions(src)[i]; bySource[src] = v; rps += v }
+        for (const [src, r] of allowed) {
+          const f = fracOf.get(src) ?? 1
+          const v = r * (isCache ? f * passedRead + (1 - f) * passedWrite : passed) * fractions(src)[i]
+          bySource[src] = v; rps += v
+        }
         const dest = inflow.get(e.to) ?? new Map<string, number>()
         for (const [src, v] of Object.entries(bySource)) dest.set(src, (dest.get(src) ?? 0) + v)
         inflow.set(e.to, dest)
-        edgeRes[e.id] = { rps, dropFrac: 0, ...(lbInfo ? { lb: { status: lbInfo[i].status, share: 0, bySource } } : {}) }
+        edgeRes[e.id] = { rps, dropFrac: 0, ...hopNetwork(regions, id, e.to, avgPayload.get(id) ?? 4), ...(lbInfo ? { lb: { status: lbInfo[i].status, share: 0, bySource } } : {}) }
       })
       if (lbInfo) {
         const all = o.reduce((a, e) => a + edgeRes[e.id].rps, 0)
@@ -544,7 +574,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       if ((inj && capacity === 0) || (!limiting && (util >= 1 || (offered > 0 && dropped > 0.01 * offered)))) health = 'failed'
       else if (util >= 0.7 || (limiting && dropped > 0.01 * offered)) health = 'strained'
     }
-    nodes[id] = { offered, served, dropped, util, latency, queueDepth: depth, health, poolUsed, poolSize, hit, injected: injRaw, down: !!inj && capacity === 0, capacity: tokens !== undefined ? rateLimit : capacity, limiter, lagMs, staleReads, failover, blocked, cold, concurrency, conns, scaling, shards: c.kind === 'database' && shardN > 1 ? { count: shardN, hot: hotShare, even: 1 / shardN } : undefined, broker, warmth, stampede, breaker: breakerState, ...(hold > 1.01 ? { hold } : {}), ...(callFail > 0.001 ? { callTimeouts: callFail } : {}) }
+    nodes[id] = { offered, served, dropped, util, latency, queueDepth: depth, health, poolUsed, poolSize, hit, readHit, injected: injRaw, down: !!inj && capacity === 0, capacity: tokens !== undefined ? rateLimit : capacity, limiter, lagMs, staleReads, failover, blocked, cold, concurrency, conns, scaling, shards: c.kind === 'database' && shardN > 1 ? { count: shardN, hot: hotShare, even: 1 / shardN } : undefined, broker, warmth, stampede, breaker: breakerState, ...(hold > 1.01 ? { hold } : {}), ...(callFail > 0.001 ? { callTimeouts: callFail } : {}) }
   }
 
   for (const e of edges) {
@@ -567,8 +597,9 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       const share = (edgeRes[e.id]?.rps ?? 0) / n.served
       const tc = byId.get(e.to)!
       const tn = nodes[e.to]
-      d += share * (tn.latency + downLat[e.to])
-      b += share * (BASE_LATENCY_MS[tc.kind] + downBase[e.to])
+      const net = (edgeRes[e.id]?.rttMs ?? 0) + (edgeRes[e.id]?.transferMs ?? 0) // a worker is held while the call travels, too
+      d += share * (net + tn.latency + downLat[e.to])
+      b += share * (net + BASE_LATENCY_MS[tc.kind] + downBase[e.to])
       const drop = tn.offered > 0 ? tn.dropped / tn.offered : 0
       f += share * (drop + (1 - drop) * downFail[e.to])
     }
@@ -644,6 +675,20 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       }
     }
   }
+  // Network time: every connection a request crosses adds its round trip, for the share of requests that cross it.
+  let netMs = 0
+  if (legit > 0) {
+    for (const e of edges) {
+      const r = edgeRes[e.id]
+      if (!r) continue
+      const net = r.rttMs + r.transferMs
+      if (net <= 0) continue
+      const w = Math.min(1, r.rps / legit)
+      netMs += w * net
+      p50 += w * net
+      p99 += w * net * NET_TAIL
+    }
+  }
   // Client timeouts and retry policy. A request slower than its client's timeout counts as failed, whatever the server did.
   let timeoutShare = 0
   let retriesSum = 0
@@ -671,6 +716,6 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
 
   return {
     state: { t, retryFactor, queueDepth: nextQueue, scale: nextScale, blockedFrac, lb: nextLb, warm: nextWarm, hold: nextHold, callFail: nextCallFail, killedAt: nextKilledAt, lag: nextLag, bucket: nextBucket, dlq: nextDlq, lost: nextLost, warmth: nextWarmth, flushedAt: nextFlushedAt, breaker: nextBreaker },
-    result: { nodes, edges: edgeRes, totals: { p50: Math.min(p50, 30000), p99: Math.min(p99, 30000), errorRate, throughput: completed * (1 - timeouts), offered: clientOffered, cost, retryFactor, blocked: blockedTotal, timeouts } },
+    result: { nodes, edges: edgeRes, totals: { p50: Math.min(p50, 30000), p99: Math.min(p99, 30000), errorRate, throughput: completed * (1 - timeouts), offered: clientOffered, cost, retryFactor, blocked: blockedTotal, timeouts, netMs } },
   }
 }

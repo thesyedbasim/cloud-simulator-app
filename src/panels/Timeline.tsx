@@ -1,5 +1,6 @@
 import { History } from 'lucide-react'
 import { useSim } from '../sim/runtime'
+import { Transport } from './SimControls'
 
 /**
  * Rewind. The track is drawn over the error rate, so the moment things broke is visible as a red bump and
@@ -13,7 +14,7 @@ export function Timeline() {
   const live = scrubT === null
 
   if (!tl || tl.t1 - tl.t0 < 1) {
-    return <div className="flex h-8 items-center gap-2 border-b border-line/10 px-4 text-[11px] text-dim"><History size={12} /> Timeline fills in as the simulation runs</div>
+    return <div className="flex h-9 items-center gap-3 border-b border-line/10 px-4 text-[11px] text-dim"><Transport /><History size={12} /> Timeline fills in as the simulation runs</div>
   }
 
   const span = tl.t1 - tl.t0
@@ -25,7 +26,8 @@ export function Timeline() {
   const ago = tl.t1 - value
 
   return (
-    <div className="flex h-8 items-center gap-3 border-b border-line/10 px-4">
+    <div className="flex h-9 items-center gap-3 border-b border-line/10 px-4">
+      <Transport />
       <span className="label flex shrink-0 items-center gap-1.5"><History size={12} /> Rewind</span>
       <div className="relative h-6 min-w-0 flex-1">
         <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="pointer-events-none absolute inset-0 h-full w-full" aria-hidden>

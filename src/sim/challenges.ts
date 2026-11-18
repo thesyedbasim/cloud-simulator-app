@@ -149,7 +149,8 @@ export const CHALLENGES: Challenge[] = [
     level: 'advanced',
     incident: true,
     story: 'The database gets slow, not dead. The app servers wait on it, every worker is stuck, and soon the whole site is down, though nothing is wrong with the app tier itself.',
-    start: withConfig(linkShortener, 'app', { blocking: 1 }, 'Challenge: The slow database'),
+    // a link shortener is almost all reads (99%), which is what lets a cache keep nearly every request off the database
+    start: withConfig(withConfig(linkShortener, 'client', { readPct: 0.99 }), 'app', { blocking: 1 }, 'Challenge: The slow database'),
     goals: [{ kind: 'survive', scenario: 'slowDb' }, { kind: 'cost', maxPerHour: 1.5 }],
     hints: ['Run the Slow database scenario and open the app servers: look at the "held" workers in the explanation.', 'The app tier waits on the database for every request that reaches it. Which requests really have to?', 'A slow dependency only hurts requests that depend on it. Keep most of them off that path.'],
     rootCause: 'A cascading failure: workers that wait on a slow dependency are not free to serve anything else, so the app tier lost capacity in proportion to how slow the database got. Making the slow path rare (a better cache hit rate) protected the tier more cheaply than any amount of extra app servers, and the cost cap rules out throwing hardware at it.',

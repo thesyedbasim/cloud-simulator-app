@@ -4,6 +4,8 @@ import { toast } from 'sonner'
 import { useStore } from '../store/useStore'
 import { CONFIG_SCHEMA, KIND_INFO, configValue, type ConfigField } from '../store/types'
 import { slide } from './ui'
+import { useChallenges } from '../store/challengeStore'
+import { ChallengePanel, RightTabs } from './ChallengePanel'
 import { Sparkline } from './Sparkline'
 import { Faults } from './Faults'
 import { levelOf, maxLevelOf } from '../canvas/tier'
@@ -11,6 +13,7 @@ import { useSim } from '../sim/runtime'
 import { appCapacityPerInstance, dbCapacity, FUNCTION_COLD_START_MS, functionCapacity, functionDurationMs, hourlyCost, scaleSpec, specLine } from '../sim/capacity'
 import type { ArchComponent } from '../store/types'
 import { CONN_FIELDS, POLICIES, connValue, lbSettings, type ConnKey, type TargetStatus } from '../sim/balance'
+import { effectiveRegions, rttBetween, INHERIT_REGION } from '../sim/network'
 import { ALL_REGIONS_MASK, canGeoBlock, CLIENT_TYPES, describeGeo, geoMaskOf, geoModeOf, regionOf, REGIONS, GEO_ALLOW, GEO_BLOCK, GEO_OFF } from '../sim/geo'
 
 const fmt = (f: ConfigField, v: number) => (f.pct ? `${Math.round(v * 100)}%` : `${v}${f.unit ? ` ${f.unit}` : ''}`)
@@ -78,6 +81,7 @@ function Live({ id }: { id: string }) {
       {kind === 'serverless' && row('Running now', `${n.concurrency?.toFixed(0) ?? 0} of ${useStore.getState().architecture.components.find((c) => c.id === id)?.config.concurrency ?? 1000}`, n.util >= 0.9)}
       {kind === 'serverless' && row('Cold starts', `${Math.round((n.cold ?? 0) * 100)}% of requests`, (n.cold ?? 0) > 0.05)}
       {(kind === 'cache' || kind === 'cdn') && row('Hit rate', `${Math.round(n.hit * 100)}%`)}
+      {(kind === 'cache' || kind === 'cdn') && n.readHit !== undefined && n.offered > 0 && Math.abs(n.readHit - n.hit) > 0.005 && row('Hit rate on reads', `${Math.round(n.readHit * 100)}%`)}
       {(kind === 'cache' || kind === 'cdn') && n.warmth !== undefined && n.warmth < 0.99 && row('Warmth', `${Math.round(n.warmth * 100)}%`, n.warmth < 0.5)}
       {(kind === 'cache' || kind === 'cdn') && n.stampede !== undefined && n.stampede > 1.05 && row('Miss amplification', `${n.stampede.toFixed(1)}×`, true)}
       {n.breaker && n.breaker !== 'closed' && row('Circuit breaker', n.breaker === 'open' ? 'open: failing fast' : 'testing', true)}
@@ -281,6 +285,51 @@ function ConnectionSettings({ id }: { id: string }) {
   )
 }
 
+/** Where a component runs. Hops between different regions pay a network round trip. */
+function Location({ comp }: { comp: ArchComponent }) {
+  const update = useStore((s) => s.updateConfig)
+  const arch = useStore((s) => s.architecture)
+  const set = comp.config.region !== undefined && comp.config.region >= 0 ? Math.round(comp.config.region) : INHERIT_REGION
+  const effective = effectiveRegions(arch).get(comp.id)
+  return (
+    <div className="flex flex-col gap-2 border-b border-line/10 pb-3">
+      <span className="label">Location</span>
+      <label className="flex flex-col gap-1">
+        <span className="text-dim">Region</span>
+        <select className={select} value={set} onChange={(e) => update(comp.id, 'region', +e.target.value)} aria-label="Region this runs in">
+          <option value={INHERIT_REGION}>{effective !== undefined ? `Same as caller (${REGIONS[effective].label})` : 'Same as caller'}</option>
+          {REGIONS.map((r, i) => <option key={r.id} value={i}>{r.label}</option>)}
+        </select>
+      </label>
+      <p className="text-[11px] leading-snug text-dim">A request that crosses regions pays a round trip each way, on top of the processing time. Set a region only where it differs from the caller.</p>
+    </div>
+  )
+}
+
+/** The network cost of one connection: zero within a region. */
+function ConnectionNetwork({ id }: { id: string }) {
+  const arch = useStore((s) => s.architecture)
+  const er = useSim((s) => s.edges[id])
+  const conn = arch.connections.find((c) => c.id === id)
+  if (!conn) return null
+  const regions = effectiveRegions(arch)
+  const a = regions.get(conn.from), b = regions.get(conn.to)
+  if (a === undefined || b === undefined) return null
+  const row = (k: string, v: string) => <div className="flex items-center justify-between"><span className="text-dim">{k}</span><span className="data">{v}</span></div>
+  return (
+    <div className="flex flex-col gap-1.5 border-b border-line/10 pb-3">
+      <span className="label">Network</span>
+      {row('Between', a === b ? `${REGIONS[a].label} (same region)` : `${REGIONS[a].label} ↔ ${REGIONS[b].label}`)}
+      {a === b ? <p className="text-[11px] leading-snug text-dim">Within a region the network time is already part of each component&apos;s own latency.</p> : (
+        <>
+          {row('Round trip', `${rttBetween(a, b)} ms`)}
+          {row('Moving the response', `${(er?.transferMs ?? 0) < 10 ? (er?.transferMs ?? 0).toFixed(1) : Math.round(er?.transferMs ?? 0)} ms`)}
+        </>
+      )}
+    </div>
+  )
+}
+
 /** A slider with a minus button on its left and a plus button on its right, each moving it one step. */
 function StepSlider({ min, max, step, value, onChange, label }: { min: number; max: number; step: number; value: number; onChange: (v: number) => void; label: string }) {
   const clamp = (v: number) => Math.min(max, Math.max(min, +v.toFixed(6)))
@@ -397,6 +446,7 @@ export function Inspector() {
   const id = useStore((s) => s.selectedId)
   const connId = useStore((s) => s.selectedConnId)
   const arch = useStore((s) => s.architecture)
+  const challengeTab = useChallenges((s) => !!s.activeId && s.tab === 'challenge')
   const { renameComponent, duplicateComponent, removeComponent, removeConnection, undo } = useStore.getState()
   const comp = arch.components.find((c) => c.id === id)
   const conn = arch.connections.find((c) => c.id === connId)
@@ -411,9 +461,9 @@ export function Inspector() {
   return (
     <AnimatePresence>
       {open && (
-        <motion.aside {...slide(1)} className="panel absolute bottom-[var(--dock)] right-3 top-[68px] z-10 hidden w-60 flex-col gap-3 overflow-auto p-3 md:flex">
-          <div className="label">Inspector</div>
-          <>
+        <motion.aside {...slide(1)} className={`panel absolute bottom-[var(--dock)] right-3 top-[68px] z-10 hidden flex-col gap-3 overflow-auto p-3 md:flex ${challengeTab ? 'w-72' : 'w-60'}`}>
+          <RightTabs />
+          {challengeTab ? <ChallengePanel /> : <>
             {comp ? (
               <motion.div key={comp.id} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.15 }} className="flex flex-col gap-3">
                 <div>
@@ -446,6 +496,7 @@ export function Inspector() {
                 {(
                   <Section title="Advanced settings" open={comp.kind === 'client' || comp.kind === 'loadBalancer'}>
                     {comp.kind === 'client' && <ClientSource comp={comp} />}
+                    {comp.kind !== 'client' && <Location comp={comp} />}
                     {comp.kind === 'loadBalancer' && <Balancer comp={comp} />}
                     {comp.kind === 'gateway' && <RateLimiter comp={comp} />}
                     {canGeoBlock(comp.kind) && <GeoRule comp={comp} />}
@@ -461,6 +512,7 @@ export function Inspector() {
               <motion.div key={conn.id} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.15 }} className="flex flex-col gap-3">
                 <div className="text-sm font-semibold">Connection</div>
                 <div className="data text-xs text-dim">{name(conn.from)} → {name(conn.to)}</div>
+                <ConnectionNetwork id={conn.id} />
                 <ConnectionSettings id={conn.id} />
                 <button className={`${btn} text-failed`} onClick={() => removeConnection(conn.id)}><Unlink size={13} /> Remove connection</button>
               </motion.div>
@@ -469,7 +521,7 @@ export function Inspector() {
                 Select a component or connection. Drag a component to move it, or drag from the <span className="text-accent">+</span> handle to another component to connect.
               </motion.p>
             )}
-          </>
+          </>}
         </motion.aside>
       )}
     </AnimatePresence>

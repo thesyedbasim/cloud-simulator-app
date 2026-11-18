@@ -158,6 +158,11 @@ export const DEFAULT_CONFIG: Record<ComponentKind, Record<string, number>> = {
 }
 
 /** Defaults for optional settings, used when a component does not carry them. */
+// Every component except a client can be placed in a region (-1 = wherever its caller is). A client's region is its own setting above.
+for (const kind of Object.keys(CONFIG_SCHEMA) as ComponentKind[]) {
+  if (kind !== 'client') CONFIG_SCHEMA[kind].push({ key: 'region', label: 'Region', min: -1, max: 5, step: 1, optional: true, hidden: true })
+}
+
 export const OPTIONAL_DEFAULTS: Partial<Record<ComponentKind, Record<string, number>>> = {
   gateway: { limitOn: 1, geoMode: 0, geoMask: 0, limitAlgo: 0, burstSec: 2, perClientOn: 0, perClientRps: 500 },
   serverless: { provisioned: 0 },

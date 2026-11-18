@@ -2,8 +2,10 @@ import { create } from 'zustand'
 import { DEFAULT_CONFIG, KIND_INFO, type Actual, type Architecture, type ArchComponent, type ComponentKind, type Experiment, type Slo } from './types'
 import { initialArchitecture } from './project'
 import { findFreeCell } from './arch'
+import { toast } from 'sonner'
+import { runLocked, useChallenges } from './challengeStore'
 
-export type ConnectResult = 'ok' | 'self' | 'duplicate' | 'reverse'
+export type ConnectResult = 'ok' | 'self' | 'duplicate' | 'reverse' | 'locked'
 type Cell = { col: number; row: number }
 
 interface UIState {
@@ -92,7 +94,7 @@ function makeComponent(arch: Architecture, kind: ComponentKind, col: number, row
 const startArchitecture = initialArchitecture()
 skipUsedIds(startArchitecture)
 
-export const useStore = create<UIState>((set, get) => ({
+export const useStore = create<UIState>((set, get) => lockEdits({
   architecture: startArchitecture,
   savedAt: null,
   past: [],
@@ -108,8 +110,9 @@ export const useStore = create<UIState>((set, get) => ({
   leftOpen: true,
   rightOpen: true,
 
-  select: (id) => set((s) => ({ selectedId: id, selectedConnId: null, rightOpen: id ? true : s.rightOpen })),
-  selectConn: (id) => set((s) => ({ selectedConnId: id, selectedId: null, rightOpen: id ? true : s.rightOpen })),
+  // picking something on the canvas shows its settings, even when the Challenge tab was showing
+  select: (id) => { if (id) useChallenges.getState().setTab('inspector'); set((s) => ({ selectedId: id, selectedConnId: null, rightOpen: id ? true : s.rightOpen })) },
+  selectConn: (id) => { if (id) useChallenges.getState().setTab('inspector'); set((s) => ({ selectedConnId: id, selectedId: null, rightOpen: id ? true : s.rightOpen })) },
   setDragKind: (dragKind) => set({ dragKind }),
   setHoverCell: (hoverCell) => set({ hoverCell }),
   setHoverId: (hoverId) => set({ hoverId }),
@@ -246,6 +249,22 @@ export const useStore = create<UIState>((set, get) => ({
     set({ architecture: next, past: [...s.past, s.architecture], future: s.future.slice(1), ...pruneSelection(s, next) })
   },
 }))
+
+/** The actions that change the design. While a challenge run plays, each is refused: a run tests one fixed design. */
+function lockEdits(store: UIState): UIState {
+  const refuse = { addComponent: () => '', addNear: () => null, addConnection: () => 'locked', addServerGroup: () => null } as Record<string, () => unknown>
+  const edits = ['addComponent', 'addNear', 'moveComponent', 'removeComponent', 'duplicateComponent', 'renameComponent', 'updateConfig', 'updateConfigs', 'addConnection', 'removeConnection', 'updateConnection', 'addServerGroup', 'undo', 'redo'] as const
+  const out = store as unknown as Record<string, (...a: unknown[]) => unknown>
+  for (const name of edits) {
+    const fn = out[name]
+    out[name] = (...args: unknown[]) => {
+      if (!runLocked()) return fn(...args)
+      toast('The design is locked while the run plays', { id: 'run-locked', description: 'Stop the run to edit it.' })
+      return refuse[name]?.()
+    }
+  }
+  return store
+}
 
 function pruneSelection(s: UIState, a: Architecture) {
   return {
