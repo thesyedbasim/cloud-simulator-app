@@ -1,4 +1,4 @@
-import { ClipboardCheck, Route, PanelLeft, PanelRight, Plus, Minus, Maximize2, Undo2, Redo2 } from 'lucide-react'
+import { ClipboardCheck, PanelLeft, PanelRight, Plus, Minus, Maximize2, Undo2, Redo2 } from 'lucide-react'
 import { useEffect, useMemo } from 'react'
 import NumberFlow from '@number-flow/react'
 import { Toaster, toast } from 'sonner'
