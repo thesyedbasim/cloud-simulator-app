@@ -1,0 +1,87 @@
+name: Release
+
+# When a pull request is merged into main, publish a GitHub release for it.
+# The pull request's label picks the version bump:
+#   "release: major" -> v2.0.0 from v1.4.2
+#   "release: minor" -> v1.5.0 from v1.4.2
+#   "release: patch" -> v1.4.3 from v1.4.2
+# The release notes list every commit of the pull request. A merge without one of these labels publishes nothing.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags and history, to find the last release
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # the pull request this commit on main came from
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            echo "::notice::No pull request for $GITHUB_SHA, so no release."
+            exit 0
+          fi
+
+          # which release label it carries
+          labels=$(gh pr view "$pr" --json labels --jq '.labels[].name')
+          bump=""
+          for kind in major minor patch; do
+            if printf '%s\n' "$labels" | grep -qx "release: $kind"; then
+              if [ -n "$bump" ]; then echo "::error::PR #$pr has more than one release label."; exit 1; fi
+              bump="$kind"
+            fi
+          done
+          if [ -z "$bump" ]; then
+            echo "::notice::PR #$pr has no 'release: major|minor|patch' label, so no release."
+            exit 0
+          fi
+
+          # next version from the latest vX.Y.Z tag (v0.0.0 if there is none)
+          last=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          prev="${last:-v0.0.0}"
+          IFS=. read -r major minor patch <<< "${prev#v}"
+          case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          next="v$major.$minor.$patch"
+          if git rev-parse -q --verify "refs/tags/$next" > /dev/null; then
+            echo "::error::Tag $next already exists."
+            exit 1
+          fi
+
+          # notes: every commit of the pull request is one line of the changelog
+          {
+            echo "## What's changed"
+            echo
+            gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$pr/commits" \
+              --jq '.[] | "- " + (.commit.message | split("\n")[0]) + " (`" + .sha[0:7] + "`)"'
+            echo
+            echo "Pull request: #$pr"
+            if [ -n "$last" ]; then
+              echo
+              echo "**Full changelog**: https://github.com/$GITHUB_REPOSITORY/compare/$last...$next"
+            fi
+          } > notes.md
+
+          gh release create "$next" --target "$GITHUB_SHA" --title "$next" --notes-file notes.md
+          echo "Released $next ($bump) from PR #$pr"
