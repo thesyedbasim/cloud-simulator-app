@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from 'motion/react'
-import { Minus, ChevronDown, ArrowDownToLine, ArrowUpFromLine, Copy, Plus, ShieldBan, Trash2, Unlink } from 'lucide-react'
+import { Minus, ChevronDown, ArrowDownToLine, ArrowUpFromLine, Copy, Plus, Trash2, Unlink } from 'lucide-react'
 import { toast } from 'sonner'
 import { useStore } from '../store/useStore'
 import { CONFIG_SCHEMA, KIND_INFO, configValue, type ConfigField } from '../store/types'
@@ -10,10 +10,13 @@ import { Sparkline } from './Sparkline'
 import { Faults } from './Faults'
 import { levelOf, maxLevelOf } from '../canvas/tier'
 import { useSim } from '../sim/runtime'
-import { appCapacityPerInstance, dbCapacity, FUNCTION_COLD_START_MS, functionCapacity, functionDurationMs, hourlyCost, scaleSpec, specLine } from '../sim/capacity'
+import { appCapacityPerInstance, dbCapacity, FUNCTION_COLD_START_MS, coresOf, functionCapacity, functionDurationMs, hourlyCost, scaleSpec, specLine } from '../sim/capacity'
 import type { ArchComponent } from '../store/types'
 import { CONN_FIELDS, POLICIES, connValue, lbSettings, type ConnKey, type TargetStatus } from '../sim/balance'
 import { effectiveRegions, rttBetween, INHERIT_REGION } from '../sim/network'
+import { reachableApps, canHaveApps } from '../sim/apps'
+import { FunctionCalculator } from './FunctionCalculator'
+import type { Trigger } from '../sim/triggers'
 import { ALL_REGIONS_MASK, canGeoBlock, CLIENT_TYPES, describeGeo, geoMaskOf, geoModeOf, regionOf, REGIONS, GEO_ALLOW, GEO_BLOCK, GEO_OFF } from '../sim/geo'
 
 const fmt = (f: ConfigField, v: number) => (f.pct ? `${Math.round(v * 100)}%` : `${v}${f.unit ? ` ${f.unit}` : ''}`)
@@ -47,7 +50,7 @@ function Live({ id }: { id: string }) {
     <div className="flex items-center justify-between"><span className="text-dim">{k}</span><span className={`data ${warn ? 'text-failed' : ''}`}>{v}</span></div>
   )
   return (
-    <div className="flex flex-col gap-1.5 border-b border-line/10 pb-3">
+    <div className="flex flex-col gap-1.5">
       <div className="flex items-center justify-between">
         <span className="label">Live</span>
         <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${h.cls}`}>{n.down ? 'Down' : h.label}</span>
@@ -58,16 +61,20 @@ function Live({ id }: { id: string }) {
       </div>
       {isFinite(n.capacity) && n.offered > 0 && row('Headroom', `${(n.capacity / n.offered).toFixed(2)}×`, n.capacity / n.offered < 1.2)}
       {row('Incoming', `${Math.round(n.offered)} rps`)}
+      {n.readShare !== undefined && n.offered >= 1 && row('Reads / writes', `${Math.round(n.offered * n.readShare)} / ${Math.round(n.offered * (1 - n.readShare))} rps`)}
       {n.blocked >= 0.5 && row('Blocked by geo rule', `${Math.round(n.blocked)} rps`)}
       {row('Dropped', `${Math.round(n.dropped)} rps`, n.dropped > 0.01 * n.offered && n.dropped >= 1)}
       {row('Latency', `${n.latency < 1000 ? Math.round(n.latency) : (n.latency / 1000).toFixed(1) + 'k'} ms`)}
+      {n.fn && n.fn.oom >= 0.01 && row('Out of memory', `${Math.round(n.fn.oom * 100)}% of runs fail`, true)}
+      {n.fn && n.fn.slowdown > 1.05 && row('Short of CPU', `runs ${n.fn.slowdown.toFixed(1)}× slower`, true)}
       {n.scaling && row('Instances', `${n.scaling.active} of ${n.scaling.max}`)}
       {n.scaling && n.scaling.pending > 0 && row('Starting', `+${n.scaling.pending}, ready in ${Math.ceil(n.scaling.nextReadyIn ?? 0)} s`)}
       {kind === 'queue' && row('Depth', `${Math.round(n.queueDepth)}`)}
       {kind === 'database' && n.conns && n.conns.demand >= 1 && row(n.conns.pooled ? 'Function connections (shared)' : 'Function connections', `${Math.round(n.conns.demand)}${n.conns.pooled ? '' : ` of ${n.conns.max}`}`, !n.conns.pooled && n.conns.demand > n.conns.max)}
       {n.limiter && n.limiter.algo === 1 && row('Tokens left', `${Math.round(n.limiter.level)} of ${Math.round(n.limiter.max)}`, n.limiter.level < n.limiter.max * 0.1)}
       {n.limiter && n.limiter.algo === 2 && row('Waiting in bucket', `${Math.round(n.limiter.level)} of ${Math.round(n.limiter.max)}`, n.limiter.level > n.limiter.max * 0.8)}
-      {n.limiter && n.limiter.limitedByClient >= 1 && row('Over a client limit', `${Math.round(n.limiter.limitedByClient)} rps`, true)}
+      {n.limiter && n.limiter.limitedByClient - n.limiter.limitedByIp >= 1 && row('Over a client limit', `${Math.round(n.limiter.limitedByClient - n.limiter.limitedByIp)} rps`, true)}
+      {n.limiter && n.limiter.limitedByIp >= 1 && row('Over a per-IP limit', `${Math.round(n.limiter.limitedByIp)} rps`, true)}
       {n.fanout && row('Fan-out tail', `${n.fanout.n} parallel calls: p99 of the wait ×${n.fanout.tail.toFixed(1)}`, n.fanout.tail > 1.5)}
       {kind === 'database' && n.staleReads === 0 && n.lagMs !== undefined && row('Consistency', 'strong: no stale reads')}
       {kind === 'database' && n.shards && row('Busiest shard', `${Math.round(n.shards.hot * 100)}% of traffic (${n.shards.count} shards)`, n.shards.hot > n.shards.even * 1.3)}
@@ -96,8 +103,7 @@ function ClientSource({ comp }: { comp: ArchComponent }) {
   const update = useStore((s) => s.updateConfig)
   const type = Math.round(configValue('client', comp.config, 'clientType') ?? 0)
   return (
-    <div className="flex flex-col gap-2 border-b border-line/10 pb-3">
-      <span className="label">Traffic source</span>
+    <div className="flex flex-col gap-2">
       <label className="flex flex-col gap-1">
         <span className="text-dim">Region</span>
         <select className={select} value={regionOf(comp)} onChange={(e) => update(comp.id, 'region', +e.target.value)} aria-label="Region traffic comes from">
@@ -124,11 +130,8 @@ function GeoRule({ comp }: { comp: ArchComponent }) {
   const modes = [{ id: GEO_OFF, label: 'Off' }, { id: GEO_ALLOW, label: 'Allow only' }, { id: GEO_BLOCK, label: 'Block' }]
   const cost = comp.kind !== 'appServers' ? 'Rejected at the edge, almost free.' : 'Rejected here, but each one still costs some CPU. Block it earlier if you can.'
   return (
-    <div className="flex flex-col gap-2 rounded-control border border-line/10 bg-line/[0.03] p-2.5">
-      <div className="flex items-center justify-between">
-        <span className="label flex items-center gap-1.5"><ShieldBan size={12} /> Geo rule</span>
-        {n && n.blocked >= 0.5 && <span className="data text-[11px] text-dim">{Math.round(n.blocked)} rps blocked</span>}
-      </div>
+    <div className="flex flex-col gap-2">
+      {n && n.blocked >= 0.5 && <span className="data text-[11px] text-dim">{Math.round(n.blocked)} rps blocked</span>}
       <div role="radiogroup" aria-label="Geo rule mode" className="grid grid-cols-3 gap-1">
         {modes.map((m) => (
           <button key={m.id} role="radio" aria-checked={mode === m.id} onClick={() => setMode(m.id)}
@@ -186,8 +189,7 @@ function RateLimiter({ comp }: { comp: ArchComponent }) {
   const algo = Math.round(configValue('gateway', comp.config, 'limitAlgo') ?? 0)
   if (!on) return null
   return (
-    <div className="flex flex-col gap-2 rounded-control border border-line/10 bg-line/[0.03] p-2.5">
-      <span className="label">Rate limiter algorithm</span>
+    <div className="flex flex-col gap-2">
       <select className={select} value={algo} onChange={(e) => updateConfig(comp.id, 'limitAlgo', +e.target.value)} aria-label="Rate limiter algorithm">
         {LIMIT_ALGOS.map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
       </select>
@@ -209,8 +211,7 @@ function Balancer({ comp }: { comp: ArchComponent }) {
   const capTotal = caps.reduce((a, b) => a + b, 0)
   const policy = POLICIES[s.policy]
   return (
-    <div className="flex flex-col gap-2 rounded-control border border-line/10 bg-line/[0.03] p-2.5">
-      <span className="label">Balancing</span>
+    <div className="flex flex-col gap-2">
       <select className={select} value={s.policy} onChange={(e) => updateConfig(comp.id, 'policy', +e.target.value)} aria-label="Balancing policy">
         {POLICIES.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
       </select>
@@ -285,6 +286,150 @@ function ConnectionSettings({ id }: { id: string }) {
   )
 }
 
+/** Create applications on an app tier: each one lists the downstream components it calls. */
+function Applications({ comp }: { comp: ArchComponent }) {
+  const arch = useStore((s) => s.architecture)
+  const setApps = useStore((s) => s.setApps)
+  const outs = arch.connections.filter((e) => e.from === comp.id).map((e) => arch.components.find((c) => c.id === e.to)).filter((c): c is ArchComponent => !!c)
+  const apps = comp.apps ?? []
+  const patch = (id: string, f: (a: NonNullable<ArchComponent['apps']>[number]) => NonNullable<ArchComponent['apps']>[number]) => setApps(comp.id, apps.map((a) => (a.id === id ? f(a) : a)))
+  const create = () => setApps(comp.id, [...apps, { id: `app${Date.now().toString(36)}${apps.length}`, name: `Application ${apps.length + 1}`, targets: [] }])
+  if (outs.length === 0) return <p className="text-[11px] leading-snug text-dim">Connect this to something downstream (a database, a bucket) to define applications that use it.</p>
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="text-[11px] leading-snug text-dim">An application is a kind of request: its read/write mix, size and cost, and the components it calls. Clients choose how much traffic goes to each. With none, traffic splits evenly.</p>
+      {apps.map((a) => (
+        <div key={a.id} className="flex flex-col gap-1.5 rounded-control border border-line/10 bg-line/[0.03] p-2">
+          <div className="flex items-center gap-1">
+            <input value={a.name} onChange={(e) => patch(a.id, (x) => ({ ...x, name: e.target.value }))} aria-label="Application name"
+              className="min-w-0 flex-1 rounded-control border border-transparent bg-transparent px-1 py-0.5 text-xs font-semibold hover:border-line/20 focus:border-accent focus:outline-none" />
+            <button onClick={() => setApps(comp.id, apps.filter((x) => x.id !== a.id))} aria-label={`Delete ${a.name}`} className="grid size-6 shrink-0 place-items-center rounded text-dim hover:bg-line/10 hover:text-failed"><Trash2 size={12} /></button>
+          </div>
+          <div className="flex flex-col gap-1">
+            <div className="flex items-center justify-between text-[11px]"><span className="text-dim">Reads (rest are writes)</span><span className="data">{Math.round((a.readPct ?? 0.9) * 100)}%</span></div>
+            <StepSlider min={0} max={100} step={5} value={Math.round((a.readPct ?? 0.9) * 100)} onChange={(v) => patch(a.id, (x) => ({ ...x, readPct: v / 100 }))} label={`${a.name} reads`} />
+            <div className="flex items-center justify-between text-[11px]"><span className="text-dim">Response size</span><span className="data">{a.payloadKb ?? 4} KB</span></div>
+            <StepSlider min={1} max={1000} step={1} value={a.payloadKb ?? 4} onChange={(v) => patch(a.id, (x) => ({ ...x, payloadKb: v }))} label={`${a.name} response size`} />
+            {comp.kind !== 'serverless' && (<>
+            <div className="flex items-center justify-between text-[11px]"><span className="text-dim">Request cost (CPU)</span><span className="data">{a.weight ?? 1}×</span></div>
+            <StepSlider min={1} max={5} step={0.5} value={a.weight ?? 1} onChange={(v) => patch(a.id, (x) => ({ ...x, weight: v }))} label={`${a.name} request cost`} />
+            </>)}
+            {comp.kind === 'serverless' && (<>
+              <div className="flex items-center justify-between text-[11px]"><span className="text-dim">Time per run</span><span className="data">{a.runMs ?? 100} ms</span></div>
+              <StepSlider min={10} max={10000} step={10} value={a.runMs ?? 100} onChange={(v) => patch(a.id, (x) => ({ ...x, runMs: v }))} label={`${a.name} time per run`} />
+              <div className="flex items-center justify-between text-[11px]"><span className="text-dim">Memory per run</span><span className="data">{a.memoryMb ?? 128} MB</span></div>
+              <StepSlider min={64} max={3008} step={64} value={a.memoryMb ?? 128} onChange={(v) => patch(a.id, (x) => ({ ...x, memoryMb: v }))} label={`${a.name} memory per run`} />
+              <div className="flex items-center justify-between text-[11px]"><span className="text-dim">Cores per run</span><span className="data">{a.cores ?? 0.25}</span></div>
+              <StepSlider min={0.05} max={3} step={0.05} value={a.cores ?? 0.25} onChange={(v) => patch(a.id, (x) => ({ ...x, cores: v }))} label={`${a.name} cores per run`} />
+              <p className="text-[10px] leading-snug text-dim">The function needs at least this memory (or runs fail) and this many cores (or runs slow down).</p>
+            </>)}
+          </div>
+          <span className="label pt-1">Calls</span>
+          {outs.map((o) => (
+            <label key={o.id} className="flex cursor-pointer items-center gap-1.5 text-[11px]">
+              <input type="checkbox" className="accent-accent" checked={a.targets.includes(o.id)}
+                onChange={() => patch(a.id, (x) => ({ ...x, targets: x.targets.includes(o.id) ? x.targets.filter((t) => t !== o.id) : [...x.targets, o.id] }))} />
+              <span className="truncate">{o.name}</span>
+            </label>
+          ))}
+        </div>
+      ))}
+      <button className={btn} onClick={create}><Plus size={13} /> Create an application</button>
+    </div>
+  )
+}
+
+const TRIGGER_SOURCES: ArchComponent['kind'][] = ['database', 'bucket', 'queue']
+
+/** What runs a function besides requests: a timer, or writes to another component. A function that writes to what triggers it makes a loop. */
+function Triggers({ comp }: { comp: ArchComponent }) {
+  const arch = useStore((s) => s.architecture)
+  const setTriggers = useStore((s) => s.setTriggers)
+  const n = useSim((s) => s.nodes[comp.id])
+  const list = comp.triggers ?? []
+  const sources = arch.components.filter((c) => TRIGGER_SOURCES.includes(c.kind))
+  const patch = (id: string, f: (t: Trigger) => Trigger) => setTriggers(comp.id, list.map((t) => (t.id === id ? f(t) : t)))
+  const add = (kind: Trigger['kind']) => setTriggers(comp.id, [...list, kind === 'schedule' ? { id: `t${Date.now().toString(36)}${list.length}`, kind, everySec: 60, batch: 1 } : { id: `t${Date.now().toString(36)}${list.length}`, kind, source: sources[0]?.id, ratio: 1 }])
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="text-[11px] leading-snug text-dim">Besides requests, a function can run on a timer or whenever something is written. Triggered runs follow the application you pick (its reads and writes); with none, they write.</p>
+      {n?.trigger && n.trigger.rps > 0 && !n.trigger.loop && <p className="text-[11px] leading-snug text-dim">Running from triggers: <span className="data text-text">{n.trigger.rps < 10 ? n.trigger.rps.toFixed(1) : Math.round(n.trigger.rps)}</span> per second. Only <b>writes</b> to the source start a run, not reads.</p>}
+      {n?.trigger?.loop && n.trigger.rps >= 1 && <p className="rounded-control bg-failed/10 px-2 py-1.5 text-[11px] leading-snug text-failed">Loop: this function writes to something that triggers it. Triggered runs: {Math.round(n.trigger.rps).toLocaleString()} per second.</p>}
+      {list.map((t) => (
+        <div key={t.id} className="flex flex-col gap-1.5 rounded-control border border-line/10 bg-line/[0.03] p-2">
+          <div className="flex items-center justify-between"><span className="text-xs font-semibold">{t.kind === 'schedule' ? 'On a schedule' : 'On writes'}</span>
+            <button onClick={() => setTriggers(comp.id, list.filter((x) => x.id !== t.id))} aria-label="Remove trigger" className="grid size-6 place-items-center rounded text-dim hover:bg-line/10 hover:text-failed"><Trash2 size={12} /></button></div>
+          {t.kind === 'schedule' ? (<>
+            <div className="flex items-center justify-between text-[11px]"><span className="text-dim">Every</span><span className="data">{t.everySec ?? 60} s</span></div>
+            <StepSlider min={1} max={600} step={1} value={t.everySec ?? 60} onChange={(v) => patch(t.id, (x) => ({ ...x, everySec: v }))} label="Seconds between runs" />
+            <div className="flex items-center justify-between text-[11px]"><span className="text-dim">Runs each time</span><span className="data">{t.batch ?? 1}</span></div>
+            <StepSlider min={1} max={1000} step={1} value={t.batch ?? 1} onChange={(v) => patch(t.id, (x) => ({ ...x, batch: v }))} label="Invocations per run" />
+          </>) : (<>
+            <label className="flex flex-col gap-1"><span className="text-[11px] text-dim">When this is written to</span>
+              <select className={select} value={t.source ?? ''} onChange={(e) => patch(t.id, (x) => ({ ...x, source: e.target.value }))} aria-label="Trigger source">
+                {sources.length === 0 && <option value="">Add a database, bucket or queue</option>}
+                {sources.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select></label>
+            <div className="flex items-center justify-between text-[11px]"><span className="text-dim">Runs per write</span><span className="data">{t.ratio ?? 1}</span></div>
+            <StepSlider min={0} max={5} step={0.1} value={t.ratio ?? 1} onChange={(v) => patch(t.id, (x) => ({ ...x, ratio: v }))} label="Invocations per write" />
+          </>)}
+          {(comp.apps?.length ?? 0) > 0 && (
+            <label className="flex flex-col gap-1"><span className="text-[11px] text-dim">Runs this application</span>
+              <select className={select} value={t.app ?? ''} onChange={(e) => patch(t.id, (x) => ({ ...x, app: e.target.value || undefined }))} aria-label="Application the trigger runs">
+                <option value="">Default run (100 ms)</option>
+                {comp.apps!.map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+              </select></label>
+          )}
+        </div>
+      ))}
+      <div className="flex flex-wrap gap-2">
+        <button className={`${btn} min-w-0 flex-1`} onClick={() => add('schedule')}><Plus size={13} /> Schedule</button>
+        <button className={`${btn} min-w-0 flex-1`} onClick={() => add('event')} disabled={sources.length === 0} title={sources.length ? undefined : 'Add a database, bucket or queue first'}><Plus size={13} /> On writes</button>
+      </div>
+    </div>
+  )
+}
+
+/** On a client: how its traffic divides between the applications it can reach. */
+function AppMix({ comp }: { comp: ArchComponent }) {
+  const arch = useStore((s) => s.architecture)
+  const setMix = useStore((s) => s.setMix)
+  const reach = reachableApps(arch, comp.id)
+  if (reach.length === 0) return null
+  const byOwner = new Map<string, typeof reach>()
+  for (const r of reach) byOwner.set(r.owner.id, [...(byOwner.get(r.owner.id) ?? []), r])
+  const mix = comp.mix ?? {}
+  return (
+    <div className="flex flex-col gap-2">
+      {[...byOwner.values()].map((group) => {
+        // Always shown as percentages of this tier's traffic that add up to 100.
+        const raw = group.map((r) => Math.max(0, mix[r.app.id] ?? 0))
+        const sum = raw.reduce((a, b) => a + b, 0)
+        const pct = raw.map((x) => (sum > 0 ? (x / sum) * 100 : 100 / group.length))
+        // Dragging one slider takes from (or gives to) the others in proportion to what they hold now, so the total stays 100.
+        const setOne = (i: number, v: number) => {
+          const rest = 100 - v
+          const others = pct.reduce((a, x, j) => a + (j === i ? 0 : x), 0)
+          const next = pct.map((x, j) => (j === i ? v : others > 0 ? (x / others) * rest : group.length > 1 ? rest / (group.length - 1) : 0))
+          setMix(comp.id, { ...mix, ...Object.fromEntries(group.map((g, j) => [g.app.id, next[j]])) })
+        }
+        return (
+          <div key={group[0].owner.id} className="flex flex-col gap-1.5">
+            <span className="truncate text-[11px] text-dim">{group[0].owner.name}</span>
+            {group.map((r, i) => (
+              <div key={r.app.id} className="flex flex-col gap-0.5">
+                <div className="flex items-center justify-between text-xs"><span className="truncate">{r.app.name}</span><span className="data">{Math.round(pct[i])}%</span></div>
+                <StepSlider min={0} max={100} step={1} value={Math.round(pct[i])} onChange={(v) => setOne(i, v)} label={`${r.app.name} share`} />
+              </div>
+            ))}
+          </div>
+        )
+      })}
+      <p className="text-[11px] leading-snug text-dim">The shares always add up to 100%: moving one slider rebalances the others.</p>
+    </div>
+  )
+}
+
 /** Where a component runs. Hops between different regions pay a network round trip. */
 function Location({ comp }: { comp: ArchComponent }) {
   const update = useStore((s) => s.updateConfig)
@@ -343,14 +488,16 @@ function StepSlider({ min, max, step, value, onChange, label }: { min: number; m
   )
 }
 
-/** A titled, collapsible group in the inspector. Without a title the content just sits there. */
-function Section({ title, children, open = true }: { title: string; children: React.ReactNode; open?: boolean }) {
+/** A titled, collapsible group in the inspector. Closed unless asked otherwise; `hint` is a short summary shown on the closed header. */
+function Section({ title, children, open = false, hint }: { title: string; children: React.ReactNode; open?: boolean; hint?: string }) {
   return (
-    <details open={open} className="group/sec flex flex-col gap-3 border-t border-line/15 pt-2.5">
-      <summary className="label flex cursor-pointer list-none items-center justify-between select-none [&::-webkit-details-marker]:hidden">
-        {title}<ChevronDown size={13} className="transition-transform group-open/sec:rotate-180" />
+    <details open={open} className="group/sec border-t border-line/12">
+      <summary className="flex cursor-pointer list-none items-center gap-2 rounded-control px-1 py-2 text-xs font-medium select-none hover:bg-line/[0.06] [&::-webkit-details-marker]:hidden">
+        <span className="min-w-0 flex-1 truncate">{title}</span>
+        {hint && <span className="data shrink-0 text-[10px] font-normal text-dim group-open/sec:hidden">{hint}</span>}
+        <ChevronDown size={14} className="shrink-0 text-dim transition-transform group-open/sec:rotate-180" />
       </summary>
-      <div className="flex flex-col gap-3 pt-1">{children}</div>
+      <div className="flex flex-col gap-3 px-1 pb-3 pt-1">{children}</div>
     </details>
   )
 }
@@ -380,16 +527,16 @@ function Hardware({ comp, part }: { comp: ArchComponent; part: 'summary' | 'scal
       ? `${fmtN(rps)} rps per instance. Between ${fmtN(rps * min)} and ${fmtN(rps * max)} rps in total as it scales. Limited by ${limiter}.`
       : `${fmtN(rps)} rps per instance, ${fmtN(rps * min)} rps total. Limited by ${limiter}.`
   } else if (comp.kind === 'serverless') {
-    summary = `About ${Math.round(functionDurationMs(comp.config))} ms per call, up to ${fmtN(functionCapacity(comp.config))} rps at the concurrency limit. You pay per request and run time, so cost follows traffic. A new instance adds ${FUNCTION_COLD_START_MS} ms (a cold start).`
+    summary = `${comp.config.memoryMb ?? 512} MB gives ${coresOf(comp.config.memoryMb ?? 512).toFixed(2)} vCPU. About ${Math.round(functionDurationMs(comp.config))} ms per call, up to ${fmtN(functionCapacity(comp.config))} rps at the concurrency limit. Each application says how much memory and CPU a run needs: too little memory fails the run, too little CPU slows it. You pay per request and run time. A new instance adds ${FUNCTION_COLD_START_MS} ms (a cold start).`
   } else if (comp.kind === 'database') {
     const { rps, limiter } = dbCapacity(comp.config)
     const r = Math.round(configValue('database', comp.config, 'replicas') ?? 0)
     summary = `${fmtN(rps)} rps capacity. Limited by ${limiter}. A bigger pool only helps while connections are the bottleneck.${r > 0 ? ` Reads are spread over the primary and ${r} replica${r === 1 ? '' : 's'}; every write still goes to the primary, so replicas help read-heavy traffic most.` : ''}`
   }
   if (part === 'scale') return hasSize ? (
-    <div className="flex gap-2">
-      <button className={`${btn} flex-1`} onClick={() => apply(1)} disabled={!canUp} title="Double vCPUs and memory"><ArrowUpFromLine size={13} /> Scale up</button>
-      <button className={`${btn} flex-1`} onClick={() => apply(-1)} disabled={!canDown} title="Halve vCPUs and memory"><ArrowDownToLine size={13} /> Scale down</button>
+    <div className="flex flex-wrap gap-2">
+      <button className={`${btn} min-w-0 flex-1`} onClick={() => apply(1)} disabled={!canUp} title="Double vCPUs and memory"><ArrowUpFromLine size={13} /> Scale up</button>
+      <button className={`${btn} min-w-0 flex-1`} onClick={() => apply(-1)} disabled={!canDown} title="Halve vCPUs and memory"><ArrowDownToLine size={13} /> Scale down</button>
     </div>
   ) : null
   return (
@@ -461,7 +608,7 @@ export function Inspector() {
   return (
     <AnimatePresence>
       {open && (
-        <motion.aside {...slide(1)} className={`panel absolute bottom-[var(--dock)] right-3 top-[68px] z-10 hidden flex-col gap-3 overflow-auto p-3 md:flex ${challengeTab ? 'w-72' : 'w-60'}`}>
+        <motion.aside {...slide(1)} className={`panel absolute bottom-[var(--dock)] right-3 top-[68px] z-10 hidden flex-col gap-3 overflow-y-auto overflow-x-hidden p-3 md:flex ${challengeTab ? 'w-72' : 'w-60'}`}>
           <RightTabs />
           {challengeTab ? <ChallengePanel /> : <>
             {comp ? (
@@ -478,31 +625,38 @@ export function Inspector() {
                 </div>
                 <Live id={comp.id} />
                 <Hardware comp={comp} part="summary" />
-                <Section title="Upgrade">
-                  <Hardware comp={comp} part="scale" />
-                  {CONFIG_SCHEMA[comp.kind].filter((f) => !f.hidden && (!f.showIf || (configValue(comp.kind, comp.config, f.showIf) ?? 0) >= 0.5)).map((f, i, all) => (
-                    <div key={f.key} className="flex flex-col gap-2">
-                      {f.group && f.group !== all[i - 1]?.group && <div className="label pt-1">{f.group}</div>}
-                      <Field
-                        id={comp.id}
-                        f={f}
-                        value={configValue(comp.kind, comp.config, f.key) ?? f.min}
-                        assumed={!!comp.assumed?.includes(f.key)}
-                        label={f.key === 'instances' && (configValue(comp.kind, comp.config, 'autoscale') ?? 0) >= 0.5 ? 'Instances (minimum)' : undefined}
-                      />
-                    </div>
-                  ))}
-                </Section>
-                {(
-                  <Section title="Advanced settings" open={comp.kind === 'client' || comp.kind === 'loadBalancer'}>
-                    {comp.kind === 'client' && <ClientSource comp={comp} />}
-                    {comp.kind !== 'client' && <Location comp={comp} />}
-                    {comp.kind === 'loadBalancer' && <Balancer comp={comp} />}
-                    {comp.kind === 'gateway' && <RateLimiter comp={comp} />}
-                    {canGeoBlock(comp.kind) && <GeoRule comp={comp} />}
-                    <Faults comp={comp} />
-                  </Section>
-                )}
+                {(() => {
+                  const fields = CONFIG_SCHEMA[comp.kind].filter((f) => !f.hidden && !(f.group === 'Request mix' && comp.kind === 'client' && reachableApps(arch, comp.id).length > 0) && !(f.hideIf && (configValue(comp.kind, comp.config, f.hideIf) ?? 0) >= 0.5) && (!f.showIf || (configValue(comp.kind, comp.config, f.showIf) ?? 0) >= 0.5))
+                  const groups: [string, ConfigField[]][] = []
+                  for (const f of fields) {
+                    const g = f.group ?? ''
+                    const hit = groups.find(([n]) => n === g)
+                    if (hit) hit[1].push(f); else groups.push([g, [f]])
+                  }
+                  const sized = comp.kind === 'appServers' || comp.kind === 'database'
+                  const main = groups.find(([n]) => n === '')?.[1] ?? []
+                  const rest = groups.filter(([n]) => n !== '')
+                  const hasSizeGroup = rest.some(([n]) => n === 'Instance size')
+                  const field = (f: ConfigField) => (
+                    <Field key={f.key} id={comp.id} f={f} value={configValue(comp.kind, comp.config, f.key) ?? f.min} assumed={!!comp.assumed?.includes(f.key)}
+                      label={f.key === 'instances' && (configValue(comp.kind, comp.config, 'autoscale') ?? 0) >= 0.5 ? 'Instances (minimum)' : undefined} />
+                  )
+                  return (
+                    <>
+                      {(main.length > 0 || (sized && !hasSizeGroup)) && <Section title={main.length ? 'Main settings' : 'Size'}>{sized && !hasSizeGroup && <Hardware comp={comp} part="scale" />}{main.map(field)}{comp.kind === 'serverless' && <FunctionCalculator comp={comp} />}</Section>}
+                      {rest.map(([name, fs]) => <Section key={name} title={name}>{sized && name === 'Instance size' && <Hardware comp={comp} part="scale" />}{fs.map(field)}</Section>)}
+                    </>
+                  )
+                })()}
+                {comp.kind === 'serverless' && <Section title="Triggers" hint={comp.triggers?.length ? String(comp.triggers.length) : undefined}><Triggers comp={comp} /></Section>}
+                {canHaveApps(comp) && <Section title="Applications" hint={comp.apps?.length ? String(comp.apps.length) : undefined}><Applications comp={comp} /></Section>}
+                {comp.kind === 'client' && <Section title="Traffic source"><ClientSource comp={comp} /></Section>}
+                {comp.kind === 'client' && reachableApps(arch, comp.id).length > 0 && <Section title="Application mix"><AppMix comp={comp} /></Section>}
+                {comp.kind !== 'client' && <Section title="Location"><Location comp={comp} /></Section>}
+                {comp.kind === 'loadBalancer' && <Section title="Balancing"><Balancer comp={comp} /></Section>}
+                {comp.kind === 'gateway' && (configValue('gateway', comp.config, 'limitOn') ?? 1) >= 0.5 && <Section title="Rate limiter algorithm"><RateLimiter comp={comp} /></Section>}
+                {canGeoBlock(comp.kind) && <Section title="Geo rule"><GeoRule comp={comp} /></Section>}
+                <Section title="Break it"><Faults comp={comp} /></Section>
                 <div className="flex gap-2">
                   <button className={`${btn} flex-1`} onClick={() => duplicateComponent(comp.id)}><Copy size={13} /> Duplicate</button>
                   <button className={`${btn} flex-1 text-failed`} onClick={remove}><Trash2 size={13} /> Delete</button>

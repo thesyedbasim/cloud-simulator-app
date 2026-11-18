@@ -17,7 +17,7 @@ function Body({ insight }: { insight: NonNullable<ReturnType<typeof useSim.getSt
           <p className="mt-2 rounded-control bg-line/[0.05] px-2 py-1.5 text-[12px] leading-snug"><span className="label mr-1.5">Try</span>{insight.hint}</p>
         </>
       )}
-      <div className="mt-2 flex gap-2">
+      <div className="mt-2 flex flex-wrap gap-2">
         <button onClick={() => useStore.getState().select(insight.nodeId)} className="flex items-center gap-1.5 rounded-control border border-line/15 px-2.5 py-1 text-xs transition-colors hover:bg-line/10 active:scale-95"><Crosshair size={12} /> Inspect it</button>
         <button onClick={() => setOpen((o) => !o)} aria-expanded={open} className="flex items-center gap-1 rounded-control px-2 py-1 text-xs text-dim transition-colors hover:bg-line/10 hover:text-text">{open ? 'Less' : 'Why? and what to try'} <ChevronDown size={12} className={`transition-transform ${open ? 'rotate-180' : ''}`} /></button>
       </div>

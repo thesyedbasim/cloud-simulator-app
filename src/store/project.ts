@@ -1,3 +1,4 @@
+import type { Trigger } from '../sim/triggers'
 /**
  * Project files: save, load, export, import. Everything that comes from outside (a saved copy in the
  * browser, a file the user picks) goes through parseProject, which validates and sanitises it, so a corrupt
@@ -25,6 +26,32 @@ export function serializeProject(arch: Architecture): string {
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const isKind = (v: unknown): v is ComponentKind => typeof v === 'string' && v in KIND_INFO
+
+const num = <K extends string>(v: unknown, lo: number, hi: number, key: K): Partial<Record<K, number>> => (v !== undefined && Number.isFinite(Number(v)) ? ({ [key]: Math.min(hi, Math.max(lo, Number(v))) } as Record<K, number>) : {})
+function cleanTriggers(v: unknown): Trigger[] {
+  if (!Array.isArray(v)) return []
+  const out: Trigger[] = []
+  for (const t of v.slice(0, 8)) {
+    if (!isObj(t) || typeof t.id !== 'string' || !t.id || out.some((x) => x.id === t.id) || (t.kind !== 'schedule' && t.kind !== 'event')) continue
+    out.push({ id: t.id, kind: t.kind, ...num(t.everySec, 0.1, 86400, 'everySec'), ...num(t.batch, 1, 10000, 'batch'), ...num(t.ratio, 0, 100, 'ratio'), ...num(t.readPct, 0, 1, 'readPct'), ...(typeof t.source === 'string' ? { source: t.source } : {}), ...(typeof t.app === 'string' ? { app: t.app } : {}) })
+  }
+  return out
+}
+function cleanApps(v: unknown): { id: string; name: string; targets: string[] }[] {
+  if (!Array.isArray(v)) return []
+  const out: { id: string; name: string; targets: string[] }[] = []
+  for (const a of v.slice(0, 12)) {
+    if (!isObj(a) || typeof a.id !== 'string' || !a.id || out.some((x) => x.id === a.id)) continue
+    out.push({ id: a.id, name: typeof a.name === 'string' && a.name.trim() ? a.name.trim().slice(0, 40) : 'Application', targets: Array.isArray(a.targets) ? a.targets.filter((t): t is string => typeof t === 'string').slice(0, 20) : [], ...num(a.readPct, 0, 1, 'readPct'), ...num(a.payloadKb, 1, 1000, 'payloadKb'), ...num(a.weight, 1, 5, 'weight'), ...num(a.runMs, 1, 60000, 'runMs'), ...num(a.memoryMb, 1, 10240, 'memoryMb'), ...num(a.cores, 0.01, 6, 'cores') })
+  }
+  return out
+}
+function cleanMix(v: unknown): Record<string, number> | undefined {
+  if (!isObj(v)) return undefined
+  const out: Record<string, number> = {}
+  for (const [k, x] of Object.entries(v)) { const n = Number(x); if (Number.isFinite(n)) out[k] = Math.min(100, Math.max(0, n)) }
+  return Object.keys(out).length ? out : undefined
+}
 
 export function parseProject(text: string): ParseResult {
   let raw: unknown
@@ -55,7 +82,10 @@ export function parseProject(text: string): ParseResult {
     const assumed = Array.isArray(c.assumed) ? c.assumed.filter((k): k is string => typeof k === 'string' && k in config) : undefined
     const name = typeof c.name === 'string' && c.name.trim() ? c.name.trim().slice(0, 40) : KIND_INFO[kind].label
     ids.add(c.id)
-    components.push({ id: c.id, kind, name, position: { col, row }, config, assumed })
+    const apps = kind === 'appServers' || kind === 'serverless' ? cleanApps(c.apps) : undefined
+    const triggers = kind === 'serverless' ? cleanTriggers(c.triggers) : undefined
+    const mix = kind === 'client' ? cleanMix(c.mix) : undefined
+    components.push({ id: c.id, kind, name, position: { col, row }, config, assumed, ...(apps?.length ? { apps } : {}), ...(mix ? { mix } : {}), ...(triggers?.length ? { triggers } : {}) })
   }
   // overlapping components would be unclickable: refuse rather than silently stacking them
   for (let i = 0; i < components.length; i++) for (let j = i + 1; j < components.length; j++) {

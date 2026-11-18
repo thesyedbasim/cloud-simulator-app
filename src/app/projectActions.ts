@@ -3,7 +3,6 @@ import { toast } from 'sonner'
 import { sceneRef } from '../canvas/CanvasView'
 import { useStore } from '../store/useStore'
 import { parseProject, saveToStorage, serializeProject } from '../store/project'
-import { buildReport } from '../sim/report'
 import { decodeShare, encodeShare } from '../sim/share'
 import { resetSim, useSim } from '../sim/runtime'
 import { BLANK } from '../presets/index'
@@ -31,15 +30,6 @@ export function openDesign(arch: Architecture, message?: string) {
   resetSim()
   requestAnimationFrame(() => sceneRef.current?.fit(false))
   toast(message ?? `Opened ${arch.name}`, { action: { label: 'Undo', onClick: () => { useStore.getState().undo(); requestAnimationFrame(() => sceneRef.current?.fit(false)) } } })
-}
-
-/** Download a written design review (Markdown) for the current design. */
-export function exportReport() {
-  const arch = useStore.getState().architecture
-  const url = URL.createObjectURL(new Blob([buildReport(arch)], { type: 'text/markdown' }))
-  download(url, `${slug(arch.name)}.report.md`)
-  setTimeout(() => URL.revokeObjectURL(url), 1000)
-  toast('Report downloaded', { description: 'Estimates from the model, with its caveats stated in the file.' })
 }
 
 /** Copy a link that carries the whole design in its address (nothing is uploaded anywhere). */

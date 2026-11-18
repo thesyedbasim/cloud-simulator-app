@@ -22,7 +22,6 @@ interface UIState {
   ctx: { id: string; x: number; y: number } | null
   /** Design A for compare mode: a snapshot of the architecture at the time it was pinned. */
   pinned: { arch: Architecture; at: number } | null
-  review: { open: boolean; tab: 'review' | 'compare' | 'capacity' }
   leftOpen: boolean
   rightOpen: boolean
 
@@ -45,7 +44,6 @@ interface UIState {
   deleteExperiment: (id: string) => void
   pin: () => void
   unpin: () => void
-  setReview: (open: boolean, tab?: 'review' | 'compare' | 'capacity') => void
   /** Replace the whole design as ONE undo step (used by suggested fixes). Pins the previous design as A if none is pinned. */
   applyArchitecture: (arch: Architecture) => void
   closeCtx: () => void
@@ -64,6 +62,9 @@ interface UIState {
   updateConfigs: (id: string, patch: Record<string, number>) => void
   addConnection: (from: string, to: string) => ConnectResult
   removeConnection: (id: string) => void
+  setApps: (id: string, apps: NonNullable<ArchComponent['apps']>) => void
+  setMix: (id: string, mix: Record<string, number>) => void
+  setTriggers: (id: string, triggers: NonNullable<ArchComponent['triggers']>) => void
   /** Change settings on a connection (weight, backup, drain) as one undo step. */
   updateConnection: (id: string, patch: Record<string, number>) => void
   /** Add an App Servers block next to a load balancer and connect the two. Returns the new block's id. */
@@ -106,7 +107,6 @@ export const useStore = create<UIState>((set, get) => lockEdits({
   hoverId: null,
   ctx: null,
   pinned: null,
-  review: { open: false, tab: 'review' },
   leftOpen: true,
   rightOpen: true,
 
@@ -139,7 +139,6 @@ export const useStore = create<UIState>((set, get) => lockEdits({
   deleteExperiment: (id) => set((s) => ({ architecture: { ...s.architecture, experiments: (s.architecture.experiments ?? []).filter((e) => e.id !== id) } })),
   pin: () => set((s) => ({ pinned: { arch: s.architecture, at: Date.now() } })),
   unpin: () => set({ pinned: null }),
-  setReview: (open, tab) => set((s) => ({ review: { open, tab: tab ?? s.review.tab } })),
   applyArchitecture: (arch) => {
     const s = get()
     skipUsedIds(arch)
@@ -232,6 +231,30 @@ export const useStore = create<UIState>((set, get) => lockEdits({
     set({ ...commit(s, { ...s.architecture, components: [...s.architecture.components, c], connections: [...s.architecture.connections, { id: uid('conn'), from: lbId, to: c.id }] }), selectedId: c.id, selectedConnId: null, rightOpen: true })
     return c.id
   },
+  setApps: (id, apps) => {
+    const s = get()
+    const now = Date.now()
+    const coalesce = lastEdit.key === `apps:${id}` && now - lastEdit.at < 800
+    lastEdit = { key: `apps:${id}`, at: now }
+    const architecture = { ...s.architecture, components: s.architecture.components.map((c) => (c.id === id ? { ...c, apps } : c)) }
+    set(coalesce ? { architecture } : commit(s, architecture))
+  },
+  setTriggers: (id, triggers) => {
+    const s = get()
+    const now = Date.now()
+    const coalesce = lastEdit.key === `trig:${id}` && now - lastEdit.at < 800
+    lastEdit = { key: `trig:${id}`, at: now }
+    const architecture = { ...s.architecture, components: s.architecture.components.map((c) => (c.id === id ? { ...c, triggers } : c)) }
+    set(coalesce ? { architecture } : commit(s, architecture))
+  },
+  setMix: (id, mix) => {
+    const s = get()
+    const now = Date.now()
+    const coalesce = lastEdit.key === `mix:${id}` && now - lastEdit.at < 800
+    lastEdit = { key: `mix:${id}`, at: now }
+    const architecture = { ...s.architecture, components: s.architecture.components.map((c) => (c.id === id ? { ...c, mix } : c)) }
+    set(coalesce ? { architecture } : commit(s, architecture))
+  },
   removeConnection: (id) => {
     const s = get()
     set({ ...commit(s, { ...s.architecture, connections: s.architecture.connections.filter((c) => c.id !== id) }), selectedConnId: null })
@@ -253,7 +276,7 @@ export const useStore = create<UIState>((set, get) => lockEdits({
 /** The actions that change the design. While a challenge run plays, each is refused: a run tests one fixed design. */
 function lockEdits(store: UIState): UIState {
   const refuse = { addComponent: () => '', addNear: () => null, addConnection: () => 'locked', addServerGroup: () => null } as Record<string, () => unknown>
-  const edits = ['addComponent', 'addNear', 'moveComponent', 'removeComponent', 'duplicateComponent', 'renameComponent', 'updateConfig', 'updateConfigs', 'addConnection', 'removeConnection', 'updateConnection', 'addServerGroup', 'undo', 'redo'] as const
+  const edits = ['addComponent', 'addNear', 'moveComponent', 'removeComponent', 'duplicateComponent', 'renameComponent', 'updateConfig', 'updateConfigs', 'addConnection', 'removeConnection', 'setApps', 'setMix', 'setTriggers', 'updateConnection', 'addServerGroup', 'undo', 'redo'] as const
   const out = store as unknown as Record<string, (...a: unknown[]) => unknown>
   for (const name of edits) {
     const fn = out[name]

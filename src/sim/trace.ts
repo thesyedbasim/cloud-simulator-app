@@ -8,6 +8,7 @@ import type { NodeResult, StepResult } from './engine'
 import { FUNCTION_COLD_START_MS } from './capacity'
 import { describeGeo, geoAllows, regionOf, REGIONS } from './geo'
 import { configValue } from '../store/types'
+import { appShares, appsOf, effectiveClients } from './apps'
 
 export interface Hop {
   nodeId: string
@@ -68,7 +69,8 @@ function whyDropped(n: NodeResult, kind: ComponentKind): string {
   return `it is over capacity (${Math.round(n.util * 100)}% load)`
 }
 
-function walk(arch: Architecture, res: StepResult, rand: () => number, id: number, from?: string, type: TraceType = 'any'): Trace | null {
+function walk(arch: Architecture, res: StepResult, rand: () => number, id: number, from?: string, wanted: TraceType = 'any', appId?: string): Trace | null {
+  let type = wanted
   const byId = new Map(arch.components.map((c) => [c.id, c]))
   const out = new Map<string, { id: string; to: string }[]>()
   for (const e of arch.connections) out.set(e.from, [...(out.get(e.from) ?? []), { id: e.id, to: e.to }])
@@ -91,6 +93,13 @@ function walk(arch: Architecture, res: StepResult, rand: () => number, id: numbe
   if (chosen) cur = chosen
 
   const origin = cur
+  // A chosen application decides what the request is: a read or a write, by that application's read share.
+  if (appId && type === 'any') {
+    const owner = arch.components.find((c) => c.apps?.some((a) => a.id === appId))
+    const def = owner?.apps?.find((a) => a.id === appId)
+    if (def) type = rand() < (def.readPct ?? 0.9) ? 'read' : 'write'
+  }
+  const pending: { at: (typeof arch.components)[number]; edge: string; to: string }[] = [] // later calls of an application that calls several targets
   const hops: Hop[] = []
   const edges: string[] = []
   for (let guard = 0; guard < MAX_HOPS; guard++) {
@@ -110,7 +119,7 @@ function walk(arch: Architecture, res: StepResult, rand: () => number, id: numbe
       // while a database's primary is down and a replica is being promoted, writes fail and reads carry on
       const failover = cur.kind === 'database' && n.failover?.phase === 'failing'
       const isWrite = type === 'write' || type === 'upload'
-      const readP = configValue('client', origin.config, 'readPct') ?? 0.9
+      const readP = configValue('client', (effectiveClients(arch).get(origin.id) ?? origin).config, 'readPct') ?? 0.9
       let dropP = n.down ? 1 : n.offered > 0 ? n.dropped / n.offered : 0
       if (failover && !n.down && type !== 'any') dropP = isWrite ? 1 : n.offered > 0 ? Math.min(1, Math.max(0, (n.dropped - (1 - readP) * n.offered) / Math.max(1e-9, readP * n.offered))) : 0
       if (rand() < dropP) {
@@ -142,7 +151,31 @@ function walk(arch: Architecture, res: StepResult, rand: () => number, id: numbe
       hops.push({ nodeId: cur.id, name: cur.name, kind: cur.kind, ms, netMs, outcome: 'ok', note })
     }
     let next = out.get(cur.id)
+    // An application on this tier decides which connections the request uses: the one asked for, or one drawn from the client's mix.
+    const tierApps = next?.length ? appsOf(cur, next.map((x) => x.to)) : []
+    if (tierApps.length) {
+      const asked = tierApps.findIndex((a) => a.id === appId)
+      let k = asked
+      if (k < 0) { const sh = appShares(tierApps, origin); let r = rand(); k = sh.findIndex((x) => (r -= x) <= 0); if (k < 0) k = tierApps.length - 1 }
+      const app = tierApps[k]
+      const legs = app.targets.map((t) => next!.find((x) => x.to === t)).filter((x): x is { id: string; to: string } => !!x)
+      const tierNode = cur
+      next = legs.slice(0, 1)
+      for (const l of legs.slice(1)) pending.push({ at: tierNode, edge: l.id, to: l.to })
+      if (hops.length) hops[hops.length - 1].note += ` · ${app.name}`
+    }
     if (type === 'upload' && next?.length) { const toward = next.filter((x) => toStore.has(x.to)); if (toward.length) next = toward }
+    if (!next?.length && pending.length) {
+      // this leg is done: the application's tier makes its next call
+      const p = pending.shift()!
+      hops.push({ nodeId: p.at.id, name: p.at.name, kind: p.at.kind, ms: 0, netMs: 0, outcome: 'ok', note: 'back here to make the next call' })
+      edges.push('') // no connection between the end of one call and the tier that made it
+      edges.push(p.edge)
+      const nxt = byId.get(p.to)
+      if (!nxt) return null
+      cur = nxt
+      continue
+    }
     if (!next?.length) {
       const total = timeOf(hops)
       return { id, type, hops, edges, outcome: 'ok', failedAt: null, totalMs: total, netMs: netOf(hops), summary: `Completed at ${cur.name}.` }
@@ -165,10 +198,10 @@ function walk(arch: Architecture, res: StepResult, rand: () => number, id: numbe
  * Sample a trace. With `via`, keeps drawing until the request travels over that connection (used when the
  * user clicks a moving dot on it), falling back to an ordinary trace if the connection carries no traffic.
  */
-export function sampleTrace(arch: Architecture, res: StepResult, seed: number, via?: string, from?: string, type: TraceType = 'any'): Trace | null {
+export function sampleTrace(arch: Architecture, res: StepResult, seed: number, via?: string, from?: string, type: TraceType = 'any', app?: string): Trace | null {
   let first: Trace | null = null
   for (let attempt = 0; attempt < (via ? 300 : 1); attempt++) {
-    const t = walk(arch, res, rng(seed + attempt * 7919), seed, from, type)
+    const t = walk(arch, res, rng(seed + attempt * 7919), seed, from, type, app)
     if (!t) continue
     first ??= t
     if (!via || t.edges.includes(via)) return t
@@ -182,6 +215,8 @@ export interface TraceOptions {
   from?: string
   outcome: TraceOutcomeFilter
   type: TraceType
+  /** Id of an application to trace: the request follows what that application calls. Unset = drawn from each client's mix. */
+  app?: string
 }
 
 const quantile = (sorted: number[], q: number) => (sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] : 0)
@@ -194,15 +229,15 @@ const MAX_TRIES = 400
  * reasonable number of draws, in which case an ordinary trace comes back so there is still something to show.
  */
 export function findTrace(arch: Architecture, res: StepResult, seed: number, opts: TraceOptions, via?: string): { trace: Trace | null; matched: boolean } {
-  if (opts.outcome === 'any') return { trace: sampleTrace(arch, res, seed, via, opts.from, opts.type), matched: true }
+  if (opts.outcome === 'any') return { trace: sampleTrace(arch, res, seed, via, opts.from, opts.type, opts.app), matched: true }
   let slowMs = Infinity
   if (opts.outcome === 'slow') {
     const ms: number[] = []
-    for (let i = 0; i < PROBE; i++) { const t = walk(arch, res, rng(seed + (i + 1) * 104729), seed, opts.from, opts.type); if (t?.outcome === 'ok') ms.push(t.totalMs) }
+    for (let i = 0; i < PROBE; i++) { const t = walk(arch, res, rng(seed + (i + 1) * 104729), seed, opts.from, opts.type, opts.app); if (t?.outcome === 'ok') ms.push(t.totalMs) }
     slowMs = quantile(ms.sort((a, b) => a - b), 0.95)
   }
   for (let i = 0; i < MAX_TRIES; i++) {
-    const t = walk(arch, res, rng(seed + i * 7919), seed, opts.from, opts.type)
+    const t = walk(arch, res, rng(seed + i * 7919), seed, opts.from, opts.type, opts.app)
     if (!t) continue
     if (via && !t.edges.includes(via)) continue
     const ok = opts.outcome === 'ok' ? t.outcome === 'ok'
@@ -210,7 +245,7 @@ export function findTrace(arch: Architecture, res: StepResult, seed: number, opt
       : t.outcome === 'ok' && t.totalMs >= slowMs
     if (ok) return { trace: t, matched: true }
   }
-  return { trace: sampleTrace(arch, res, seed, via, opts.from, opts.type), matched: false }
+  return { trace: sampleTrace(arch, res, seed, via, opts.from, opts.type, opts.app), matched: false }
 }
 
 export interface TraceSummary {
@@ -227,12 +262,12 @@ export interface TraceSummary {
 }
 
 /** Trace many requests and summarise them. */
-export function sampleTraces(arch: Architecture, res: StepResult, seed: number, n: number, from?: string, type: TraceType = 'any'): TraceSummary | null {
+export function sampleTraces(arch: Architecture, res: StepResult, seed: number, n: number, from?: string, type: TraceType = 'any', app?: string): TraceSummary | null {
   const okMs: number[] = []
   const fails = new Map<string, { name: string; count: number }>()
   let ok = 0, dropped = 0, blocked = 0, total = 0
   for (let i = 0; i < n; i++) {
-    const t = walk(arch, res, rng(seed + i * 7919), seed + i, from, type)
+    const t = walk(arch, res, rng(seed + i * 7919), seed + i, from, type, app)
     if (!t) continue
     total++
     if (t.outcome === 'ok') { ok++; okMs.push(t.totalMs) }

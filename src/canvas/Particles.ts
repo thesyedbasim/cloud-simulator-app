@@ -63,10 +63,15 @@ export class Particles {
     const live = new Set(paths.keys())
 
     if (res && this.flow > 0.02) {
+      // Dots per second are proportional to each connection's throughput (so a 30/70 split looks like 30/70), scaled down together
+      // so the busiest connection never exceeds 16 dots/s. Only the very quietest connections are lifted to stay visible.
+      let peak = 0
+      for (const e of Object.values(res.edges)) peak = Math.max(peak, e.rps)
+      const k = Math.min(0.1, peak > 0 ? 16 / peak : 0.1)
       for (const [id, e] of Object.entries(res.edges)) {
         const path = paths.get(id)
         if (!path || path.len < 1 || e.rps < 1) continue
-        const rate = Math.min(16, 2 + e.rps / 70) * this.flow
+        const rate = Math.max(0.4, e.rps * k) * this.flow
         let a = (this.spawn.get(id) ?? 0) + rate * dt
         while (a >= 1 && this.ps.length < this.cap) {
           a -= 1

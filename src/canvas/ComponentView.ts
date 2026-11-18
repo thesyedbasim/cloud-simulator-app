@@ -3,6 +3,7 @@ import { GEO_OFF, geoModeOf, REGIONS, regionOf } from '../sim/geo'
 import { gridToScreen, footprint } from '../lib/iso'
 import type { Theme } from '../lib/theme'
 import { configValue, type ArchComponent } from '../store/types'
+import { clientRps } from '../sim/ips'
 import { clientMonitors, levelOf, queueCrates } from './tier'
 import { isoBox, isoCylinder, isoTube, isoWire, setPaper, solid } from './drawing'
 import type { NodeResult } from '../sim/engine'
@@ -85,7 +86,7 @@ export class ComponentView extends Container {
     switch (this.comp.kind) {
       case 'client': {
         // more traffic, more monitors on the desk
-        const n = clientMonitors(configValue('client', cfg, 'rps') ?? 500)
+        const n = clientMonitors(clientRps(this.comp) || 500)
         isoBox(g, col + 0.3, row + 0.3, 1.4, 1.4, 4, c, 0, 0.1)
         const s = n === 1 ? 0.6 : n === 2 ? 0.46 : 0.34
         const step = s + 0.08
@@ -223,24 +224,14 @@ export class ComponentView extends Container {
   private buildHitArea(col: number, row: number) {
     const [ft, fr, fb, fl] = footprint(col, row, 2, 2)
     const b = this.body.getLocalBounds()
-    const x0 = Math.min(b.minX, fl.x) - 4
-    const x1 = Math.max(b.maxX, fr.x) + 4
-    // how far the body rises above the ground footprint; the top edge follows the iso diamond, not a box
-    // autoscaled tiers draw their slots live above a low platform, so reserve room for them
-    const lift = Math.max(this.isAuto ? 30 : 0, ft.y - b.minY) + 4
-    const yEnd = fb.y + 46
+    // The footprint diamond extruded up to the top of the drawn body: no padding, no label strip, so clicks beside a component
+    // (and on the thin connection lines near it) fall through to the ground.
+    const lift = Math.max(this.isAuto ? 30 : 0, ft.y - b.minY)
+    const shape = [fl.x, fl.y, fl.x, fl.y - lift, ft.x, ft.y - lift, fr.x, fr.y - lift, fr.x, fr.y, fb.x, fb.y]
+    this.footPoly = new Polygon(shape)
+    this.hitPoly = new Polygon(shape)
     const hit = new Graphics()
-    // Remembered so the scene can ask "is this point on the component?" with plain geometry (see containsWorld).
-    const fp = footprint(col - 0.1, row - 0.1, 2.2, 2.2)
-    this.footPoly = new Polygon(fp.flatMap((q) => [q.x, q.y]))
-    this.hitPoly = new Polygon([
-      x0, fl.y - lift, ft.x, ft.y - lift, x1, fr.y - lift, x1, fr.y,
-      fb.x + 52, fb.y, fb.x + 52, yEnd, fb.x - 52, yEnd, fb.x - 52, fb.y, x0, fl.y,
-    ])
-    hit.hitArea = new Polygon([
-      x0, fl.y - lift, ft.x, ft.y - lift, x1, fr.y - lift, x1, fr.y,
-      fb.x + 52, fb.y, fb.x + 52, yEnd, fb.x - 52, yEnd, fb.x - 52, fb.y, x0, fl.y,
-    ])
+    hit.hitArea = new Polygon(shape)
     hit.eventMode = 'static'
     this.addChildAt(hit, 0)
   }

@@ -1,8 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { decodeShare, encodeShare, SHARE_MAX, SHARE_PREFIX } from './share'
-import { buildReport } from './report'
 import { compareToReality, project, CLOSE_FACTOR } from './reality'
-import { SCENARIOS } from './scenarios'
 import { parseProject, serializeProject } from '../store/project'
 import { useStore, designChanged } from '../store/useStore'
 import { linkShortener } from '../presets/linkShortener'
@@ -52,40 +50,6 @@ describe('share links', () => {
     const many = { ...linkShortener, components: Array.from({ length: 60 }, (_, i) => ({ ...linkShortener.components[2], id: `a${i}`, name: 'x'.repeat(40), position: { col: i * 2, row: 0 }, assumed: Object.keys(linkShortener.components[2].config) })), connections: [] }
     const h = encodeShare({ ...many, experiments: Array.from({ length: 20 }, (_, i) => ({ id: `e${i}`, name: 'n'.repeat(60), events: Array.from({ length: 30 }, () => ({ at: 1, target: 'a0', action: 'slow' as const })) })) })
     expect(h === null || h.length <= SHARE_MAX).toBe(true)
-  })
-})
-
-describe('design report', () => {
-  const report = buildReport({ ...linkShortener, experiments: [{ id: 'e', name: 'Kill the | app', events: [{ at: 5, target: 'app', action: 'lostInstance' }] }], actual: { p99Ms: 400, errorPct: 3 } })
-  it('is deterministic: the same design gives the same report', () => {
-    expect(buildReport(linkShortener)).toBe(buildReport(linkShortener))
-  })
-  it('has a title and says that everything is an estimate', () => {
-    expect(report).toMatch(/^# Link Shortener: design report/)
-    expect(report).toMatch(/estimate/i)
-    expect(report).toMatch(/not a load test/)
-  })
-  it('covers the summary, every scenario, single points of failure, recovery and headroom', () => {
-    for (const h of ['## Summary', '## Stress tests', '## Single points of failure', '## Recovery objectives', '## Headroom']) expect(report).toContain(h)
-    for (const s of SCENARIOS) expect(report).toContain(`| ${s.label} |`)
-    expect(report).toMatch(/Estimated cost:\*\* \$1\.25 per hour/)
-    expect(report).toMatch(/Database:?\*?\*?/)
-  })
-  it('lists chaos experiments and the reality check when there are some, and not otherwise', () => {
-    expect(report).toContain('## Chaos experiments')
-    expect(report).toContain('## Projected vs actual')
-    const plain = buildReport(linkShortener)
-    expect(plain).not.toContain('## Chaos experiments')
-    expect(plain).not.toContain('## Projected vs actual')
-  })
-  it('keeps a pipe in a name from breaking the table', () => {
-    expect(report).toContain('Kill the \\| app')
-  })
-  it('marks scenarios that cannot run instead of leaving a hole', () => {
-    expect(report).toMatch(/\| Hot partition \| not applicable/)
-  })
-  it('reports on a design with no database and no clients without failing', () => {
-    expect(() => buildReport({ name: 'Empty', components: [], connections: [] })).not.toThrow()
   })
 })
 
