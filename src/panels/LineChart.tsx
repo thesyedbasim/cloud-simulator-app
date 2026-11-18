@@ -14,7 +14,7 @@ export function LineChart({ title, series, unit, faultAt, yMax, height = 120 }: 
     <figure className="m-0">
       <figcaption className="mb-1 flex items-center justify-between text-xs">
         <span className="label">{title}</span>
-        <span className="flex gap-3">
+        <span className="flex flex-wrap justify-end gap-x-3">
           {series.map((s) => (
             <span key={s.label} className="flex items-center gap-1.5 text-dim">
               <svg width="14" height="6" aria-hidden><line x1="0" y1="3" x2="14" y2="3" stroke={s.color} strokeWidth="2" strokeDasharray={s.dashed ? '3 2' : undefined} /></svg>

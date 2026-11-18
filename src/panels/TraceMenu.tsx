@@ -35,10 +35,11 @@ function Seg<T extends string | number>({ value, options, onChange, label }: { v
 export function TraceMenu() {
   const components = useStore((s) => s.architecture.components)
   const clients = useMemo(() => components.filter((c) => c.kind === 'client'), [components])
+  const apps = useMemo(() => components.flatMap((c) => (c.apps ?? []).map((a) => ({ ...a, owner: c.name }))), [components])
   const opts = useTrace((s) => s.opts)
   const count = useTrace((s) => s.count)
   const { setOpts, setCount, start } = useTrace.getState()
-  const custom = opts.outcome !== 'any' || opts.type !== 'any' || !!opts.from || count > 1
+  const custom = opts.outcome !== 'any' || opts.type !== 'any' || !!opts.from || !!opts.app || count > 1
   const title = count > 1 ? 'Trace 100 requests and summarise them' : 'Trace one request through the system (or Shift-click a moving dot)'
 
   return (
@@ -66,6 +67,17 @@ export function TraceMenu() {
               {clients.map((c) => <option key={c.id} value={c.id}>{c.name} · {REGIONS[regionOf(c)].label}</option>)}
             </select>
           </div>
+          {apps.length > 0 && (
+            <div>
+              <div className="label mb-1.5">Application</div>
+              <select value={opts.app ?? ''} onChange={(e) => setOpts({ app: e.target.value || undefined })} aria-label="Application to trace"
+                className="w-full rounded-control border border-line/15 bg-transparent px-2 py-1.5 text-xs hover:border-line/30 focus:border-accent focus:outline-none [&>option]:bg-surface">
+                <option value="">Any (by each client's mix)</option>
+                {apps.map((a) => <option key={a.id} value={a.id}>{a.name} · {a.owner}</option>)}
+              </select>
+              <p className="mt-1 text-[11px] text-dim">The request goes where that application calls, and is a read or a write by its read share (when the type below is Typical).</p>
+            </div>
+          )}
           <div>
             <div className="label mb-1.5">Type of request</div>
             <Seg label="Request type" value={opts.type} onChange={(type) => setOpts({ type })} options={TYPES.map((o) => ({ id: o.id, label: o.label, title: o.hint }))} />

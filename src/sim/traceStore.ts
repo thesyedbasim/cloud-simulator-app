@@ -41,7 +41,7 @@ export const useTrace = create<TraceUI>((set) => ({
     const { opts, count } = useTrace.getState()
     const seed = (Date.now() ^ (Math.random() * 0x7fffffff)) >>> 0
     if (count > 1 && !via) {
-      const summary = sampleTraces(arch, live.result, seed, count, opts.from, opts.type)
+      const summary = sampleTraces(arch, live.result, seed, count, opts.from, opts.type, opts.app)
       if (!summary) { toast("Nothing to trace", { description: 'Connect a Client to something first.' }); return }
       set({ summary, trace: null, schedule: null })
       return

@@ -131,3 +131,36 @@ describe('bot flood', () => {
     expect(analyze(gateArch({ rateLimit: 900 }, clients), res)).toBeNull()
   })
 })
+
+import { crowdOf, crowdTotal, overCap, ipRates } from './ips'
+describe('per-IP traffic', () => {
+  const client = { id: 'c', kind: 'client' as const, name: 'c', position: { col: 0, row: 0 }, config: { rps: 100, perIpOn: 1, ips: 100, ipMinRps: 1, ipMaxRps: 20, ipSkew: 0.5 } }
+  it('spreads IP rates between the minimum and maximum', () => {
+    const r = ipRates(crowdOf(client)!)
+    expect(r.length).toBe(100)
+    expect(Math.min(...r)).toBeGreaterThanOrEqual(1)
+    expect(Math.max(...r)).toBeLessThanOrEqual(20)
+  })
+  it('turns away only the IPs over the cap, and more of them as traffic grows', () => {
+    const k = crowdOf(client)!
+    expect(overCap(k, 1, 20).dropped).toBe(0)
+    const a = overCap(k, 1, 10), b = overCap(k, 2, 10)
+    expect(a.dropped).toBeGreaterThan(0)
+    expect(b.dropped).toBeGreaterThan(a.dropped)
+    expect(crowdTotal(k)).toBeGreaterThan(100)
+  })
+})
+
+describe('per-IP limit at the gateway', () => {
+  const arch = (cap: number): Architecture => {
+    const a = gateArch({ rateLimit: 10000, perIpOn: 1, perIpRps: cap }, [{ id: 'c1', rps: 100 }])
+    a.components[0].config = { ...a.components[0].config, perIpOn: 1, ips: 100, ipMinRps: 1, ipMaxRps: 20, ipSkew: 0.5 }
+    return a
+  }
+  it('turns away only the heavy IPs; a generous cap turns away nothing', () => {
+    expect(runSteps(arch(100), 3).res.nodes.gw.limiter!.limitedByIp).toBe(0)
+    const tight = runSteps(arch(5), 3).res.nodes.gw
+    expect(tight.limiter!.limitedByIp).toBeGreaterThan(0)
+    expect(tight.dropped).toBeGreaterThan(0)
+  })
+})

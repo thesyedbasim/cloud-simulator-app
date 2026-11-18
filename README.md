@@ -29,3 +29,13 @@ Vite, React, TypeScript, PixiJS (canvas), Zustand, Tailwind, Radix primitives, M
 | `docs/` | `PRODUCT_SPEC.md` (what and why), `TECHNICAL_GUIDE.md` (the original plan), `MODEL.md` (every formula and assumption in the simulation). |
 
 The marketing site lives in a separate repository, `landing/`.
+
+## Releases
+
+Releases are published automatically when a pull request is merged into `main`.
+
+1. Open a pull request into `main` and give it one label: `release: major`, `release: minor` or `release: patch`.
+2. Merge it with a normal merge commit (not squash), so every commit of the branch stays in the history.
+3. The **Release** workflow (`.github/workflows/release.yml`) bumps the version from the latest `vX.Y.Z` tag and creates a GitHub release whose notes list every commit of the pull request.
+
+A pull request without a release label publishes nothing. Versions follow [semantic versioning](https://semver.org): major for breaking changes, minor for new features, patch for fixes.

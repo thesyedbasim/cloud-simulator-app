@@ -98,7 +98,7 @@ function Editor({ draft, onChange, onClose }: { draft: Experiment; onChange: (e:
           <span className={chip(preview.slo.meetsAvailability && preview.slo.meetsLatency)}>{preview.slo.meetsAvailability && preview.slo.meetsLatency ? 'SLO met' : 'SLO missed'}</span>
         </div>
       )}
-      <div className="flex gap-2">
+      <div className="flex flex-wrap gap-2">
         <button className={btn} onClick={save}><Save size={13} /> Save</button>
         <button className={btn} onClick={() => { useSim.getState().startExperiment(draft); useChaos.getState().set(false) }} disabled={!draft.events.length}><Play size={13} /> Run live</button>
         <button className={`${btn} ml-auto`} onClick={onClose}>Cancel</button>

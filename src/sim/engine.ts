@@ -5,6 +5,10 @@
 import type { ArchComponent, Architecture, ComponentKind, FaultKind } from '../store/types'
 import { appCapacityPerInstance, brokerShape, dbCapacity, dbHotShare, dbShards, FUNCTION_COLD_START_MS, functionCapacity, functionDurationMs, hourlyCost, isBroker, queueDrain } from './capacity'
 import { configValue } from '../store/types'
+import { DEFAULT_PROFILE, runOn } from './capacity'
+import { triggerFlows, triggersOf } from './triggers'
+import { appShares, appsOf, effectiveClients } from './apps'
+import { clientRps, crowdOf, crowdTotal, overCap } from './ips'
 import { advanceEdge, backupsInUse, connValue, freshEdgeLb, HASH_BUCKETS, lbSettings, ramp, split, statusOf, type EdgeLb, type Target, type TargetStatus } from './balance'
 import { hopNetwork, effectiveRegions, NET_TAIL } from './network'
 import { BASELINE_READ, BLOCK_COST, canGeoBlock, geoAllows, loadUnit, regionOf } from './geo'
@@ -64,6 +68,10 @@ export interface ScaleState {
 
 export interface SimState {
   t: number
+  /** Write requests per second each node handled last step: what event triggers listen to. */
+  writes?: Record<string, number>
+  /** Requests per second on each connection last step. */
+  edgeRps?: Record<string, number>
   retryFactor: number
   queueDepth: Record<string, number>
   scale: Record<string, ScaleState>
@@ -120,6 +128,12 @@ export interface NodeResult {
   /** Requests per second this node's geo rule turned away. They are not errors and are not counted in `offered`. */
   blocked: number
   /** Serverless only: share of requests that started a new instance (a cold start), and executions running right now. */
+  /** Serverless: the average run time of what arrives, how much slower than needed (1 = none) it runs for lack of cores, and the share that fails for lack of memory. */
+  fn?: { avgMs: number; slowdown: number; oom: number }
+  /** Serverless: invocations from triggers per second, and whether the function's own writes can reach what triggers it. */
+  trigger?: { rps: number; external: number; loop: boolean }
+  /** Share of the incoming requests that are reads (the rest are writes). */
+  readShare?: number
   cold?: number
   concurrency?: number
   /** Databases only: connections that function instances want, the limit, and whether a pooler shares them. */
@@ -129,7 +143,7 @@ export interface NodeResult {
   /** Share of this tier's downstream calls that hit its call timeout. */
   callTimeouts?: number
   /** Rate-limiting gateways: algorithm, what is left in the bucket (tokens, or requests waiting), requests turned away for exceeding a per-client limit, and the share of each client's requests that got through. */
-  limiter?: { algo: 0 | 1 | 2; level: number; max: number; limitedByClient: number; passShare: Record<string, number> }
+  limiter?: { algo: 0 | 1 | 2; level: number; max: number; limitedByClient: number; limitedByIp: number; passShare: Record<string, number> }
   /** App tiers that make parallel downstream calls and wait for all of them: how many, and by how much waiting for the slowest stretches the p99. */
   fanout?: { n: number; tail: number }
   /** Sharded databases: shard count, the busiest shard's share of traffic, and what an even spread would give it. */
@@ -208,7 +222,18 @@ const waitsOnDownstream = (c: ArchComponent) => c.kind === 'appServers' && (conf
 export function step(arch: Architecture, prev: SimState, dt: number, opts: { shape: TrafficShape; injected?: Record<string, Injected> }): { state: SimState; result: StepResult } {
   const t = prev.t + dt
   const byId = new Map(arch.components.map((c) => [c.id, c]))
+  const eff = effectiveClients(arch) // clients with the request profile of their applications
+  const nextWrites: Record<string, number> = {}
+  const trigFlows = new Map<string, ReturnType<typeof triggerFlows>>()
+  for (const c of arch.components) {
+    if (!triggersOf(c).length) continue
+    const fl = triggerFlows(arch, c, prev.writes ?? {}, prev.edgeRps ?? {}, (configValue('serverless', c.config, 'recursionGuard') ?? 0) >= 0.5)
+    trigFlows.set(c.id, fl)
+    // each trigger is a source of its own, with the read/write mix of the work it starts
+    for (const f of fl) eff.set(f.key, { id: f.key, kind: 'client', name: 'Trigger', position: { col: 0, row: 0 }, config: { readPct: f.readPct, payloadKb: 4, weight: 1 }, ...(f.app ? { mix: { [f.app]: 100 } } : {}) })
+  }
   const edges = arch.connections.filter((e) => byId.has(e.from) && byId.has(e.to))
+  const edgeById = new Map(edges.map((e) => [e.id, e]))
   const outs = new Map<string, typeof edges>()
   const indeg = new Map<string, number>(arch.components.map((c) => [c.id, 0]))
   for (const e of edges) {
@@ -251,6 +276,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   const regions = effectiveRegions(arch)
   const avgPayload = new Map<string, number>() // average response size (KB) of what each node handles, for transfer time
   let completed = 0
+  const appFlows: { t: number; legs: string[] }[] = [] // requests that call several downstream targets at once; see the correction after the reverse pass
   let cost = 0
 
   for (const id of order) {
@@ -276,7 +302,9 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       }
     }
     const slow = inj === 'slow' ? SLOW_FACTOR : 1
-    const arriving: Map<string, number> = c.kind === 'client' ? new Map([[id, (cfg.rps ?? 0) * mult * (injRaw === 'flood' ? FLOOD_FACTOR : 1) * (1 + prev.retryFactor * (1 - (prev.blockedFrac?.[id] ?? 0)))]]) : (inflow.get(id) ?? new Map())
+    const flows = trigFlows.get(id) ?? []
+    const arriving: Map<string, number> = c.kind === 'client' ? new Map([[id, clientRps(c) * mult * (injRaw === 'flood' ? FLOOD_FACTOR : 1) * (1 + prev.retryFactor * (1 - (prev.blockedFrac?.[id] ?? 0)))]]) : new Map(inflow.get(id) ?? [])
+    for (const f of flows) if (f.rps > 0) arriving.set(f.key, f.rps)
 
     // Geo rule: traffic from a turned-away region never reaches the capacity maths below, apart from the small
     // cost of saying no (cheap at a load balancer, a little more at an app tier).
@@ -297,6 +325,21 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       const cap = configValue('gateway', cfg, 'perClientRps') ?? 500
       for (const [src, rps] of allowed) if (rps > cap) { allowed.set(src, cap); limitedByClient += rps - cap }
     }
+    let limitedByIp = 0
+    if (limitOn && (configValue('gateway', cfg, 'perIpOn') ?? 0) >= 0.5) {
+      // Each IP behind a client is capped on its own. If the client sends more than its IPs normally would (a flood, a retry storm, a scaled-up test),
+      // every IP's rate grows by the same factor, so more of them cross the line.
+      const ipCap = configValue('gateway', cfg, 'perIpRps') ?? 20
+      for (const [src, rps] of allowed) {
+        const sc = byId.get(src)
+        const crowd = sc ? crowdOf(sc) : null
+        if (!crowd || rps <= 0) continue
+        const { dropped } = overCap(crowd, rps / crowdTotal(crowd), ipCap)
+        const cut = Math.min(rps, dropped)
+        allowed.set(src, rps - cut); limitedByIp += cut
+      }
+    }
+    limitedByClient += limitedByIp // both are turned away at this gateway and counted the same way
     let offered = 0
     let readRps = 0
     let payloadSum = 0
@@ -304,7 +347,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
     const fracOf = new Map<string, number>() // the share of each source's requests that are reads
     for (const [src, rps] of allowed) {
       offered += rps
-      const sc = byId.get(src)
+      const sc = eff.get(src)
       fracOf.set(src, sc ? (configValue('client', sc.config, 'readPct') ?? 0.9) : 1)
       unitLoad += rps * (sc ? loadUnit(c.kind, sc, cEff) : 1)
       readRps += sc ? rps * (fracOf.get(src) ?? 1) : rps
@@ -361,6 +404,25 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
     const poolSize = c.kind === 'database' ? (cfg.poolSize ?? 20) : 0 // per shard
     const hold = waitsOnDownstream(c) ? (prev.hold?.[id] ?? 1) : 1
     const callFail = waitsOnDownstream(c) ? (prev.callFail?.[id] ?? 0) : 0
+    // A function runs the applications that arrive: how long they take, and whether the function has the memory and cores they need.
+    let fn: NodeResult['fn']
+    if (c.kind === 'serverless') {
+      const mem = cfg.memoryMb ?? 512
+      let ms = 0, slow = 0, oom = 0, w = 0
+      for (const [src, rps] of allowed) {
+        const plain = src.startsWith('trigger:') && !eff.get(src)?.mix // a trigger with no application runs the default
+        const apps = plain ? [] : c.apps ?? []
+        const sh = apps.length ? appShares(apps, eff.get(src)) : [1]
+        ;(apps.length ? apps : [{}]).forEach((a: { runMs?: number; memoryMb?: number; cores?: number }, k: number) => {
+          const r = runOn({ runMs: a.runMs ?? DEFAULT_PROFILE.runMs, memoryMb: a.memoryMb ?? DEFAULT_PROFILE.memoryMb, cores: a.cores ?? DEFAULT_PROFILE.cores }, mem)
+          const x = rps * sh[k]
+          ms += x * r.ms; slow += x * r.slowdown; oom += r.oom ? x : 0; w += x
+        })
+      }
+      fn = w > 0 ? { avgMs: ms / w, slowdown: slow / w, oom: oom / w } : { avgMs: runOn(DEFAULT_PROFILE, mem).ms, slowdown: 1, oom: 0 }
+    }
+    const fcfg = fn ? { ...cfg, avgRunMs: fn.avgMs } : cfg
+    if (fn) cEff = { ...cEff, config: fcfg }
     let capacity = capacityOf(cEff, instances, inj, hold)
     if (failing) capacity = Math.round(configValue('database', cfg, 'replicas') ?? 0) * Math.min(dbCapacity(cfg).rps, poolSize / (baseLat / 1000)) // only the replicas are left, and they can only read
     const readShare = offered > 0 ? readRps / offered : 1
@@ -411,7 +473,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
         broker = { partitions: b.partitions, consumers: b.consumers, active: b.active, idle: b.idle, hot: b.hot, dlqDepth: parked, poison }
       }
     } else {
-      served = (failing ? Math.min(offered * readShare, capacity) : Math.min(offered, Math.max(0, capacity - blockLoad) / unit)) * (1 - callFail) * (inj === 'bad' ? 1 - BAD_RELEASE_RATE : 1) // calls that timed out, or hit a bad release, are failures here
+      served = (failing ? Math.min(offered * readShare, capacity) : Math.min(offered, Math.max(0, capacity - blockLoad) / unit)) * (1 - callFail) * (1 - (fn?.oom ?? 0)) * (inj === 'bad' ? 1 - BAD_RELEASE_RATE : 1) // calls that timed out, or hit a bad release, are failures here
       dropped = offered - served
     }
 
@@ -426,7 +488,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
     if (c.kind === 'serverless') {
       // No queueing until the concurrency limit. Cold starts happen when load grows faster than warm instances exist:
       // every new instance serves its first request slowly.
-      const dur = functionDurationMs(cfg) * slow
+      const dur = functionDurationMs(fcfg) * slow
       const limit = cfg.concurrency ?? 1000
       const need = Math.min(limit, offered * (dur / 1000))
       const provisioned = Math.min(limit, configValue('serverless', cfg, 'provisioned') ?? 0)
@@ -436,7 +498,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       nextWarm[id] = dt > 0 ? Math.max(need, provisioned, had - (had * dt) / 60) : had // idle instances are reclaimed over about a minute
       concurrency = Math.min(need, served * (dur / 1000))
       latency = dur + cold * FUNCTION_COLD_START_MS
-      cost += hourlyCost(c.kind, { ...cfg, rps: served })
+      cost += hourlyCost(c.kind, { ...fcfg, rps: served })
     }
     let lagMs: number | undefined
     let staleReads: number | undefined
@@ -534,12 +596,26 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
         const inUse = backupsInUse(ts, s.policy)
         lbInfo = ts.map((t2, i) => ({ status: statusOf(t2, sts[i], drains[i], inUse) }))
       }
+      // Applications: a request of an application calls every target it lists, so each target sees that application's full traffic.
+      const apps = appsOf(c, o.map((e) => e.to))
+      const appEdgeShare = (srcId: string) => {
+        const shares = appShares(apps, eff.get(srcId))
+        return o.map((e) => apps.reduce((a, app, k) => a + (app.targets.includes(e.to) ? shares[k] : 0), 0))
+      }
+      if (apps.length) for (const [src, r] of allowed) {
+        const shares = appShares(apps, eff.get(src))
+        apps.forEach((app, k) => {
+          const t = r * passed * shares[k]
+          if (app.targets.length === 0) completed += t // answered by the tier itself
+          else if (app.targets.length > 1) appFlows.push({ t, legs: o.filter((e) => app.targets.includes(e.to)).map((e) => e.id) })
+        })
+      }
       o.forEach((e, i) => {
         const bySource: Record<string, number> = {}
         let rps = 0
         for (const [src, r] of allowed) {
           const f = fracOf.get(src) ?? 1
-          const v = r * (isCache ? f * passedRead + (1 - f) * passedWrite : passed) * fractions(src)[i]
+          const v = r * (isCache ? f * passedRead + (1 - f) * passedWrite : passed) * (apps.length ? appEdgeShare(src)[i] : fractions(src)[i])
           bySource[src] = v; rps += v
         }
         const dest = inflow.get(e.to) ?? new Map<string, number>()
@@ -562,7 +638,7 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       }
       const passShare: Record<string, number> = {}
       for (const [src, r0] of original!) passShare[src] = r0 > 0 ? Math.min(1, ((allowed.get(src) ?? 0) / r0) * (offered > 0 ? served / offered : 0)) : 1
-      limiter = { algo: limitAlgo, level: limitAlgo === 1 ? (tokens ?? burst) : depth, max: burst, limitedByClient, passShare }
+      limiter = { algo: limitAlgo, level: limitAlgo === 1 ? (tokens ?? burst) : depth, max: burst, limitedByClient, limitedByIp, passShare }
       offered += limitedByClient // turned away for exceeding their own limit: they count as errors, like any other 429
       dropped += limitedByClient
     }
@@ -575,6 +651,13 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
       else if (util >= 0.7 || (limiting && dropped > 0.01 * offered)) health = 'strained'
     }
     nodes[id] = { offered, served, dropped, util, latency, queueDepth: depth, health, poolUsed, poolSize, hit, readHit, injected: injRaw, down: !!inj && capacity === 0, capacity: tokens !== undefined ? rateLimit : capacity, limiter, lagMs, staleReads, failover, blocked, cold, concurrency, conns, scaling, shards: c.kind === 'database' && shardN > 1 ? { count: shardN, hot: hotShare, even: 1 / shardN } : undefined, broker, warmth, stampede, breaker: breakerState, ...(hold > 1.01 ? { hold } : {}), ...(callFail > 0.001 ? { callTimeouts: callFail } : {}) }
+    nodes[id].readShare = readShare
+    if (fn) nodes[id].fn = fn
+    nextWrites[id] = c.kind === 'client' ? 0 : served * (1 - readShare)
+    if (flows.length) {
+      const trigRps = flows.reduce((a, f) => a + f.rps, 0)
+      nodes[id].trigger = { rps: trigRps, external: Math.max(0, offered - flows.reduce((a, f) => a + (f.loop ? f.rps : 0), 0)), loop: flows.some((f) => f.loop && f.rps > 0) }
+    }
   }
 
   for (const e of edges) {
@@ -607,6 +690,12 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
     downBase[id] = b
     downFail[id] = Math.min(1, f)
   }
+  // A request that calls several targets succeeds only if every call does, but each leaf counted its own completions: count it once.
+  for (const fl of appFlows) {
+    const legOk = fl.legs.map((id) => { const e = edgeById.get(id)!, tn = nodes[e.to]; const drop = tn.offered > 0 ? tn.dropped / tn.offered : 0; return (1 - drop) * (1 - downFail[e.to]) })
+    completed -= fl.t * (legOk.reduce((a, b) => a + b, 0) - legOk.reduce((a, b) => a * b, 1))
+  }
+  completed = Math.max(0, completed)
   // Circuit breakers change state from what the calls downstream did this step.
   for (const c of arch.components) {
     const cur = nextBreaker[c.id]
@@ -714,8 +803,11 @@ export function step(arch: Architecture, prev: SimState, dt: number, opts: { sha
   const smoothing = 0.2 - 0.12 * (weightSum > 0 ? backoffShare / weightSum : 0) // backoff also makes the extra load arrive later
   const retryFactor = dt > 0 ? prev.retryFactor + (targetRetry - prev.retryFactor) * smoothing : prev.retryFactor
 
+  const nextEdgeRps: Record<string, number> = {}
+  for (const e of edges) nextEdgeRps[e.id] = edgeRes[e.id]?.rps ?? 0
+
   return {
-    state: { t, retryFactor, queueDepth: nextQueue, scale: nextScale, blockedFrac, lb: nextLb, warm: nextWarm, hold: nextHold, callFail: nextCallFail, killedAt: nextKilledAt, lag: nextLag, bucket: nextBucket, dlq: nextDlq, lost: nextLost, warmth: nextWarmth, flushedAt: nextFlushedAt, breaker: nextBreaker },
+    state: { t, writes: nextWrites, edgeRps: nextEdgeRps, retryFactor, queueDepth: nextQueue, scale: nextScale, blockedFrac, lb: nextLb, warm: nextWarm, hold: nextHold, callFail: nextCallFail, killedAt: nextKilledAt, lag: nextLag, bucket: nextBucket, dlq: nextDlq, lost: nextLost, warmth: nextWarmth, flushedAt: nextFlushedAt, breaker: nextBreaker },
     result: { nodes, edges: edgeRes, totals: { p50: Math.min(p50, 30000), p99: Math.min(p99, 30000), errorRate, throughput: completed * (1 - timeouts), offered: clientOffered, cost, retryFactor, blocked: blockedTotal, timeouts, netMs } },
   }
 }

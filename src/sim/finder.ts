@@ -40,7 +40,7 @@ const MAX_MULTIPLE = 64
 const MIN_MULTIPLE = 0.01
 
 function scaled(arch: Architecture, m: number): Architecture {
-  return { ...arch, components: arch.components.map((c) => (c.kind === 'client' ? { ...c, config: { ...c.config, rps: (c.config.rps ?? 0) * m } } : c)) }
+  return { ...arch, components: arch.components.map((c) => (c.kind === 'client' ? { ...c, config: { ...c.config, rps: (c.config.rps ?? 0) * m, ...(c.config.perIpOn ? { ips: Math.max(1, Math.round((c.config.ips ?? 100) * m)) } : {}) } } : c)) }
 }
 
 /** Long enough for retries to settle and for autoscaling to finish starting its instances. */

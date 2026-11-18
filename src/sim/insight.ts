@@ -19,6 +19,27 @@ function why(c: ArchComponent, n: NodeResult): { title: string; reasons: string[
   const cfg = c.config
   const dropPct = n.offered > 0 ? Math.round((n.dropped / n.offered) * 100) : 0
 
+  if (c.kind === 'serverless' && n.fn && n.fn.oom >= 0.05) {
+    return {
+      kind: 'oom',
+      title: `${name} is running out of memory`,
+      reasons: [
+        `${Math.round(n.fn.oom * 100)}% of the runs it receives need more memory than the ${cfg.memoryMb ?? 512} MB it has, so they fail every time. Retrying them does not help.`,
+      ],
+      hint: 'Give the function more memory (that also gives it more CPU), or lower what the application needs per run.',
+    }
+  }
+  if (c.kind === 'serverless' && n.fn && n.fn.slowdown >= 1.5) {
+    return {
+      kind: 'cpu',
+      title: `${name} is short of CPU`,
+      reasons: [
+        `The runs need more cores than ${cfg.memoryMb ?? 512} MB provides (memory sets CPU), so each takes about ${n.fn.slowdown.toFixed(1)}× as long. Slower runs hold instances longer, so it reaches its concurrency limit sooner.`,
+      ],
+      hint: 'Add memory to get more CPU, or lower the cores each run needs.',
+    }
+  }
+
   if (n.injected === 'bad') {
     return {
       kind: 'bad',
@@ -157,6 +178,22 @@ function why(c: ArchComponent, n: NodeResult): { title: string; reasons: string[
 
 /** Finds the component hurting the system most and explains why, or null when all is well. */
 export function analyze(arch: Architecture, res: StepResult): Insight | null {
+  // A function that keeps triggering itself: more runs than the outside world asks for, because its own writes start new runs.
+  for (const c of arch.components) {
+    const t = res.nodes[c.id]?.trigger
+    if (c.kind !== 'serverless' || !t?.loop || t.rps < 5 || t.rps <= 1.5 * t.external + 1) continue
+    const n = res.nodes[c.id]
+    return {
+      key: `${c.id}:loop`,
+      nodeId: c.id,
+      title: `${c.name} is triggering itself in a loop`,
+      reasons: [
+        `${c.name} writes to something that triggers it, so every write starts another run. It is now running ${n0(t.rps)} times a second from its own triggers, against ${n0(t.external)} a second that come from outside.`,
+        n.util >= 1 ? 'It has reached its concurrency limit, so other work now waits or is turned away while the cost keeps running.' : 'Each lap of the loop adds work, so the rate keeps climbing until the concurrency limit is hit. You pay for every run.',
+      ],
+      hint: 'Break the loop: write somewhere that does not trigger the function, trigger on fewer writes, or turn on "Stop recursive loops" in its settings.',
+    }
+  }
   let worst: { c: ArchComponent; n: NodeResult } | null = null
   for (const c of arch.components) {
     const n = res.nodes[c.id]

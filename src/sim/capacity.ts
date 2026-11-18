@@ -14,9 +14,34 @@ const RPS_PER_GB_DB = 20
 /** A cold start adds this much to a request that needs a brand-new function instance. */
 export const FUNCTION_COLD_START_MS = 400
 
-/** Run time of one invocation. More memory also means more CPU, so it finishes sooner (about 100 ms at 512 MB). */
+/** Memory at which a function gets one full vCPU (as on AWS Lambda). Memory sets CPU: a function with more memory also has more cores. */
+export const MB_PER_VCPU = 1769
+/** The shortest a call can take, whatever the settings. */
+export const MIN_RUN_MS = 25
+
+/** What one execution of an application needs. A request with no application of its own uses `DEFAULT_PROFILE`. */
+export interface RunProfile { runMs: number; memoryMb: number; cores: number }
+export const DEFAULT_PROFILE: RunProfile = { runMs: 100, memoryMb: 128, cores: 0.25 }
+
+/** vCPUs a function with this much memory has. */
+export const coresOf = (memoryMb: number) => memoryMb / MB_PER_VCPU
+
+/**
+ * How one execution fares on a function with `memoryMb`. `runMs` is its time when it has the cores it needs. With fewer cores than that
+ * it runs proportionally slower (needs 1 core, has 0.5: twice as long). Needing more memory than the function has makes it fail (out of memory).
+ * Extra memory beyond what the application needs does not make it faster.
+ */
+export function runOn(p: RunProfile, memoryMb: number): { ms: number; slowdown: number; oom: boolean } {
+  const slowdown = Math.max(1, p.cores / coresOf(memoryMb))
+  return { ms: Math.max(MIN_RUN_MS, p.runMs * slowdown), slowdown, oom: p.memoryMb > memoryMb }
+}
+
+/**
+ * Run time of an invocation. `avgRunMs` in the config is what the simulation worked out from the applications that actually
+ * arrive (it is absent for a plain function, which runs the default profile).
+ */
 export function functionDurationMs(c: Record<string, number>): number {
-  return Math.max(25, 100 * Math.pow(512 / (c.memoryMb ?? 512), 0.6))
+  return c.avgRunMs ?? runOn(DEFAULT_PROFILE, c.memoryMb ?? 512).ms
 }
 /** Requests per second the concurrency limit allows. */
 export const functionCapacity = (c: Record<string, number>) => (c.concurrency ?? 1000) / (functionDurationMs(c) / 1000)

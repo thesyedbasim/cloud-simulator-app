@@ -388,6 +388,12 @@ export class Scene {
   }
 
   private onMove(e: FederatedPointerEvent) {
+    // Pixi listens for moves on the whole window, so a menu, dialog or panel drawn over the canvas would still hover what is beneath it.
+    const t = (e.nativeEvent as PointerEvent | undefined)?.target
+    if (!this.drag && !this.ghost && t instanceof Element && t !== this.app.canvas) {
+      this.hover.clear(); this.h.onHover(null); this.setHoverComp(null)
+      return
+    }
     const p = this.viewport.toWorld(e.global)
     const cell = screenToGrid(p.x, p.y)
     // What is under the cursor right now? Decided on every move from the event's own hit target.

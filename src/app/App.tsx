@@ -1,5 +1,5 @@
-import { ClipboardCheck, PanelLeft, PanelRight, Plus, Minus, Maximize2, Undo2, Redo2 } from 'lucide-react'
-import { useEffect, useMemo } from 'react'
+import { PanelLeft, PanelRight, Plus, Minus, Maximize2, Undo2, Redo2 } from 'lucide-react'
+import { useEffect } from 'react'
 import NumberFlow from '@number-flow/react'
 import { Toaster, toast } from 'sonner'
 import { CanvasView, sceneRef } from '../canvas/CanvasView'
@@ -21,7 +21,6 @@ import { Timeline } from '../panels/Timeline'
 import { ProjectMenu } from '../panels/ProjectMenu'
 import { startAutosave, openDesign, openSharedFromHash } from './projectActions'
 import { PRESETS } from '../presets/index'
-import { ReviewDialog } from '../panels/ReviewDialog'
 import { Scenarios } from '../panels/Scenarios'
 import { ChaosButton, ChaosDialog } from '../panels/ChaosDialog'
 import { ChallengesButton, ChallengesDialog } from '../panels/Challenges'
@@ -30,20 +29,6 @@ import { InsightCard } from '../panels/InsightCard'
 import { SimControls } from '../panels/SimControls'
 import { Sparkline } from '../panels/Sparkline'
 import { SPEEDS, startSim, useSim } from '../sim/runtime'
-import { runSuite } from '../sim/headless'
-
-/** Opens the design review. The badge counts stress scenarios the current design fails. */
-function ReviewButton() {
-  const arch = useStore((s) => s.architecture)
-  const failing = useMemo(() => runSuite(arch).failing.length, [arch])
-  return (
-    <button onClick={() => useStore.getState().setReview(true, 'review')} title="Design review: stress test, suggested fixes, compare"
-      className="relative flex items-center gap-1.5 rounded-control border border-line/15 px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-line/10 active:scale-95">
-      <ClipboardCheck size={13} className="text-accent" /> <span className="hidden lg:inline">Review</span>
-      {failing > 0 && <span className="data absolute -right-1.5 -top-1.5 grid min-w-4 place-items-center rounded-full bg-failed px-1 text-[10px] leading-4 text-white" aria-label={`${failing} scenarios fail`}>{failing}</span>}
-    </button>
-  )
-}
 
 function TopBar() {
   const toggleLeft = useStore((s) => s.toggleLeft)
@@ -63,7 +48,6 @@ function TopBar() {
         <ChaosButton />
         <ChallengesButton />
         <TraceMenu />
-        <ReviewButton />
         <span className="h-5 w-px bg-line/15" />
         <div className="flex items-center gap-1">
         <button className={iconBtn} onClick={undo} disabled={!canUndo} aria-label="Undo" title="Undo (⌘Z)"><Undo2 size={16} /></button>
@@ -192,7 +176,6 @@ export default function App() {
       <TraceCard />
       <TraceSummaryCard />
       <InsightCard />
-      <ReviewDialog />
       <ChaosDialog />
       <ChallengesDialog />
       <HoverTooltip />

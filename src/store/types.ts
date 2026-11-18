@@ -8,6 +8,12 @@ export interface ArchComponent {
   config: Record<string, number>
   /** Config keys that are defaults rather than user-provided. Shown as "assumed". */
   assumed?: string[]
+  /** App tiers: named routes through the tier, each listing the downstream components it calls (see sim/apps.ts). */
+  apps?: { id: string; name: string; targets: string[]; readPct?: number; payloadKb?: number; weight?: number; runMs?: number; memoryMb?: number; cores?: number }[]
+  /** Clients: how much of the traffic belongs to each application (weight per application id; normalised per tier). */
+  mix?: Record<string, number>
+  /** Serverless functions: what runs them besides requests (see sim/triggers.ts). */
+  triggers?: import('../sim/triggers').Trigger[]
 }
 /** `config` holds per-connection settings (see CONN_FIELDS in sim/balance.ts): weight, backup, drain. Absent means defaults. */
 export interface Connection { id: string; from: string; to: string; config?: Record<string, number> }
@@ -50,11 +56,18 @@ export interface ConfigField { key: string; label: string; min: number; max: num
   optional?: boolean
   /** Not drawn as a generic slider: the inspector has its own control for it. */
   hidden?: boolean
+  /** Not shown while this other setting is on (something else replaces it). */
+  hideIf?: string
 }
 
 export const CONFIG_SCHEMA: Record<ComponentKind, ConfigField[]> = {
   client: [
-    { key: 'rps', label: 'Requests / sec', min: 50, max: 5000, step: 50, unit: 'rps' },
+    { key: 'rps', label: 'Requests / sec', min: 50, max: 5000, step: 50, unit: 'rps', hideIf: 'perIpOn' },
+    { key: 'perIpOn', label: 'Model individual IPs', min: 0, max: 1, step: 1, toggle: true, optional: true, group: 'Users (per IP)' },
+    { key: 'ips', label: 'Distinct IPs', min: 1, max: 5000, step: 1, showIf: 'perIpOn', optional: true, group: 'Users (per IP)' },
+    { key: 'ipMinRps', label: 'Slowest IP sends', min: 1, max: 200, step: 1, unit: 'rps', showIf: 'perIpOn', optional: true, group: 'Users (per IP)' },
+    { key: 'ipMaxRps', label: 'Busiest IP sends', min: 1, max: 2000, step: 1, unit: 'rps', showIf: 'perIpOn', optional: true, group: 'Users (per IP)' },
+    { key: 'ipSkew', label: 'Unevenness (0 = even spread, 1 = a few heavy IPs)', min: 0, max: 1, step: 0.05, showIf: 'perIpOn', optional: true, group: 'Users (per IP)' },
     { key: 'region', label: 'Region', min: 0, max: 5, step: 1, optional: true, hidden: true },
     { key: 'clientType', label: 'Client type', min: 0, max: 2, step: 1, optional: true, hidden: true },
     { key: 'payloadKb', label: 'Response size', min: 1, max: 1000, step: 1, unit: 'KB', optional: true, group: 'Request mix' },
@@ -71,6 +84,8 @@ export const CONFIG_SCHEMA: Record<ComponentKind, ConfigField[]> = {
     { key: 'burstSec', label: 'Burst allowance (seconds of traffic at the limit)', min: 0.5, max: 10, step: 0.5, unit: 's', showIf: 'limitOn', optional: true, group: 'Rate limiter' },
     { key: 'perClientOn', label: 'Limit each client separately', min: 0, max: 1, step: 1, toggle: true, showIf: 'limitOn', optional: true, group: 'Rate limiter' },
     { key: 'perClientRps', label: 'Allowed per client', min: 10, max: 5000, step: 10, unit: 'rps', showIf: 'perClientOn', optional: true, group: 'Rate limiter' },
+    { key: 'perIpOn', label: 'Limit each IP separately', min: 0, max: 1, step: 1, toggle: true, showIf: 'limitOn', optional: true, group: 'Rate limiter' },
+    { key: 'perIpRps', label: 'Allowed per IP', min: 1, max: 1000, step: 1, unit: 'rps', showIf: 'perIpOn', optional: true, group: 'Rate limiter' },
     { key: 'geoMode', label: 'Geo rule', min: 0, max: 2, step: 1, optional: true, hidden: true },
     { key: 'geoMask', label: 'Geo regions', min: 0, max: 63, step: 1, optional: true, hidden: true },
   ],
@@ -103,9 +118,10 @@ export const CONFIG_SCHEMA: Record<ComponentKind, ConfigField[]> = {
     { key: 'geoMask', label: 'Geo regions', min: 0, max: 63, step: 1, optional: true, hidden: true },
   ],
   serverless: [
-    { key: 'memoryMb', label: 'Memory (more memory = faster)', min: 128, max: 3008, step: 128, unit: 'MB' },
+    { key: 'memoryMb', label: 'Memory (also sets CPU: 1769 MB = 1 vCPU)', min: 128, max: 3008, step: 128, unit: 'MB' },
     { key: 'concurrency', label: 'Concurrency limit', min: 10, max: 3000, step: 10 },
     { key: 'provisioned', label: 'Always-warm instances', min: 0, max: 500, step: 10, optional: true },
+    { key: 'recursionGuard', label: 'Stop recursive loops (after 16 runs)', min: 0, max: 1, step: 1, toggle: true, optional: true, group: 'Loop protection' },
   ],
   database: [
     { key: 'vcpu', label: 'vCPUs', min: 1, max: 64, step: 1, group: 'Instance size' },
@@ -164,11 +180,11 @@ for (const kind of Object.keys(CONFIG_SCHEMA) as ComponentKind[]) {
 }
 
 export const OPTIONAL_DEFAULTS: Partial<Record<ComponentKind, Record<string, number>>> = {
-  gateway: { limitOn: 1, geoMode: 0, geoMask: 0, limitAlgo: 0, burstSec: 2, perClientOn: 0, perClientRps: 500 },
-  serverless: { provisioned: 0 },
+  gateway: { limitOn: 1, geoMode: 0, geoMask: 0, limitAlgo: 0, burstSec: 2, perClientOn: 0, perClientRps: 500, perIpOn: 0, perIpRps: 20 },
+  serverless: { provisioned: 0, recursionGuard: 0 },
   database: { pooler: 0, replicas: 0, replLagMs: 50, failoverSec: 30, shards: 1, hotShare: 0, consistency: 0 },
   queue: { partitions: 0, consumers: 1, hotKeyShare: 0, poisonPct: 0, dlq: 0 },
-  client: { region: 0, clientType: 0, payloadKb: 4, readPct: 0.9, weight: 1, retries: 2, backoff: 0, timeoutMs: 0 },
+  client: { region: 0, clientType: 0, payloadKb: 4, readPct: 0.9, weight: 1, retries: 2, backoff: 0, timeoutMs: 0, perIpOn: 0, ips: 100, ipMinRps: 1, ipMaxRps: 10, ipSkew: 0.5 },
   loadBalancer: { geoMode: 0, geoMask: 0, policy: 0, healthCheck: 1, hcInterval: 5, hcFails: 3, slowStartSec: 0, drainSec: 0 },
   appServers: { autoscale: 0, maxInstances: 8, warmupSec: 20, scaleUpAt: 0.7, geoMode: 0, geoMask: 0, blocking: 0, callTimeoutMs: 0, fanout: 1, breaker: 0, breakerErrPct: 0.25, breakerOpenSec: 10 },
   cache: { warmSec: 30, coalesce: 0 },

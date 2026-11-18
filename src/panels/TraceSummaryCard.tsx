@@ -29,7 +29,7 @@ export function TraceSummaryCard() {
               <div className="bg-dim" style={{ width: pct(s.blocked, s.n) }} />
               <div className="bg-failed" style={{ width: pct(s.dropped, s.n) }} />
             </div>
-            <div className="mt-1.5 flex gap-3 text-[11px]">
+            <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px]">
               <span><span className="data text-healthy">{pct(s.ok, s.n)}</span> <span className="text-dim">succeeded</span></span>
               <span><span className="data text-failed">{pct(s.dropped, s.n)}</span> <span className="text-dim">failed</span></span>
               {s.blocked > 0 && <span><span className="data">{pct(s.blocked, s.n)}</span> <span className="text-dim">blocked (geo)</span></span>}

@@ -4,6 +4,7 @@
  * tooltip and the tests all agree on what "level 3" means.
  */
 import { configValue, type ArchComponent } from '../store/types'
+import { clientRps } from '../sim/ips'
 
 export const MAX_LEVEL = 6
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
@@ -31,7 +32,7 @@ export function levelOf(c: ArchComponent): number {
     case 'cache': return cacheLevel(configValue('cache', cfg, 'hitRate') ?? 0.8)
     case 'loadBalancer': return balancerLevel(configValue('loadBalancer', cfg, 'targets') ?? 2)
     case 'queue': return queueCrates(configValue('queue', cfg, 'capacity') ?? 400) - 1
-    case 'client': return clientMonitors(configValue('client', cfg, 'rps') ?? 500)
+    case 'client': return clientMonitors(clientRps(c) || 500)
     case 'serverless': return 1 + ((cfg.memoryMb ?? 512) >= 1024 ? 1 : 0) + ((cfg.memoryMb ?? 512) >= 2048 ? 1 : 0)
     case 'cdn': return cacheLevel(configValue('cdn', cfg, 'hitRate') ?? 0.9)
     case 'bucket': return 1 + ((configValue('bucket', cfg, 'storageGb') ?? 500) >= 200 ? 1 : 0) + ((configValue('bucket', cfg, 'storageGb') ?? 500) >= 2000 ? 1 : 0)
