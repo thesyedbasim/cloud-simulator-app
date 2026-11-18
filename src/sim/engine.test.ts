@@ -52,3 +52,41 @@ describe('engine', () => {
     expect(last.nodes.q.queueDepth).toBeGreaterThan(100)
   })
 })
+
+describe('caches and the read/write mix', () => {
+  const withMix = (readPct: number, cache: Record<string, number> = {}) => ({
+    ...linkShortener,
+    components: linkShortener.components.map((c) =>
+      c.id === 'client' ? { ...c, config: { ...c.config, readPct } } : c.id === 'cache' ? { ...c, config: { ...c.config, ...cache } } : c),
+  })
+
+  it('leaves a design at the standard 90% read mix exactly as it was', () => {
+    const { last } = run(10, 'steady')
+    expect(last.nodes.cache.hit).toBeCloseTo(0.8, 5)
+    expect(last.nodes.db.offered).toBeCloseTo(120, 3) // 600 rps, 20% misses
+  })
+  it('answers fewer requests the more of them are writes, because only reads can be cached', () => {
+    const hit = (r: number) => run(10, 'steady', undefined, withMix(r)).last.nodes.cache.hit
+    expect(hit(0.5)).toBeLessThan(hit(0.9))
+    expect(hit(0.9)).toBeLessThan(hit(0.99))
+    expect(hit(0.5)).toBeCloseTo(0.8 * (0.5 / 0.9), 3)
+  })
+  it('sends every write through to the database', () => {
+    const { last } = run(10, 'steady', undefined, withMix(0.5, { hitRate: 0.9 }))
+    expect(last.nodes.db.offered).toBeGreaterThanOrEqual(0.5 * 600 - 1) // the write half, at least, however good the cache
+  })
+  it('a write-heavy client puts more on the database than a read-heavy one with the same cache', () => {
+    const load = (r: number) => run(10, 'steady', undefined, withMix(r)).last.nodes.db.offered
+    expect(load(0.5)).toBeGreaterThan(load(0.9))
+    expect(load(0.9)).toBeGreaterThan(load(0.99))
+  })
+  it('reports the hit rate on reads separately from the share of all requests answered', () => {
+    const n = run(10, 'steady', undefined, withMix(0.5)).last.nodes.cache
+    expect(n.readHit).toBeCloseTo(0.8 / 0.9, 3)
+    expect(n.hit).toBeCloseTo(n.readHit! * 0.5, 3)
+  })
+  it('no request is lost or invented on the way through', () => {
+    const { last } = run(10, 'steady', undefined, withMix(0.3))
+    expect(last.nodes.cache.served).toBeCloseTo(last.nodes.cache.served * last.nodes.cache.hit + last.nodes.db.offered, 3)
+  })
+})

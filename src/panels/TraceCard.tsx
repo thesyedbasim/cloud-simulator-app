@@ -25,7 +25,7 @@ export function TraceCard() {
   const reached = (i: number) => schedule ? elapsed >= schedule[i].start : false
   const current = schedule ? schedule.findLastIndex((w) => elapsed >= w.start) : -1
   const done = !!schedule && total > 0 && elapsed > total
-  const maxMs = trace ? Math.max(1, ...trace.hops.map((h) => h.ms)) : 1
+  const maxMs = trace ? Math.max(1, ...trace.hops.map((h) => h.ms + h.netMs)) : 1
 
   return (
     <div className="pointer-events-none absolute inset-x-3 top-[68px] z-10 flex justify-center md:left-[204px] md:right-[252px]">
@@ -43,10 +43,10 @@ export function TraceCard() {
           >
             <div className="flex items-center gap-2">
               <Route size={14} className="text-accent" />
-              <span className="font-semibold">Request trace</span>
+              <span className="font-semibold">{trace.type === 'any' ? 'Request trace' : `${trace.type[0].toUpperCase()}${trace.type.slice(1)} trace`}</span>
               {done ? (
                 <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${trace.outcome === 'ok' ? 'bg-healthy/15 text-healthy' : trace.outcome === 'blocked' ? 'bg-line/10 text-dim' : 'bg-failed/15 text-failed'}`}>
-                  {trace.outcome === 'ok' ? `Completed in ${fmtMs(trace.totalMs)}` : trace.outcome === 'blocked' ? 'Blocked by geo rule' : 'Failed'}
+                  {trace.outcome === 'ok' ? `Completed in ${fmtMs(trace.totalMs)}${trace.netMs >= 1 ? ` (${fmtMs(trace.netMs)} network)` : ''}` : trace.outcome === 'blocked' ? 'Blocked by geo rule' : 'Failed'}
                 </span>
               ) : <span className="text-[11px] text-dim">following…</span>}
               <span className="ml-auto flex gap-1">
@@ -64,12 +64,13 @@ export function TraceCard() {
                   <li key={i} className={`grid grid-cols-[88px_1fr_58px] items-center gap-2 rounded px-1.5 py-1 transition-opacity ${seen ? 'opacity-100' : 'opacity-35'} ${i === current && !done ? 'bg-accent/10' : ''}`}>
                     <div className="truncate text-[12px] font-medium" title={h.name}>{h.name}</div>
                     <div className="min-w-0">
-                      <div className="h-1.5 rounded-full bg-line/10">
-                        <div className={`h-full rounded-full transition-[width] duration-300 ${bad ? 'bg-failed' : blocked ? 'bg-dim' : h.outcome === 'hit' ? 'bg-healthy' : 'bg-accent'}`} style={{ width: seen ? `${Math.max(3, (h.ms / maxMs) * 100)}%` : 0 }} />
+                      <div className="flex h-1.5 overflow-hidden rounded-full bg-line/10">
+                        <div className="h-full bg-dim/50 transition-[width] duration-300" style={{ width: seen ? `${(h.netMs / maxMs) * 100}%` : 0 }} title="Network time" />
+                        <div className={`h-full transition-[width] duration-300 ${bad ? 'bg-failed' : blocked ? 'bg-dim' : h.outcome === 'hit' ? 'bg-healthy' : 'bg-accent'}`} style={{ width: seen ? `${Math.max(3, (h.ms / maxMs) * 100)}%` : 0 }} />
                       </div>
-                      <div className={`mt-0.5 truncate text-[10px] leading-tight ${bad ? 'text-failed' : 'text-dim'}`} title={h.note}>{KIND_INFO[h.kind].label} · {h.note}</div>
+                      <div className={`mt-0.5 truncate text-[10px] leading-tight ${bad ? 'text-failed' : 'text-dim'}`} title={h.note}>{KIND_INFO[h.kind].label} · {h.note}{h.netMs >= 1 && <span> · {fmtMs(h.netMs)} network</span>}</div>
                     </div>
-                    <div className="data text-right text-[11px]">{h.kind === 'client' ? '–' : fmtMs(h.ms)}</div>
+                    <div className="data text-right text-[11px]">{h.kind === 'client' ? '–' : fmtMs(h.ms + h.netMs)}</div>
                   </li>
                 )
               })}

@@ -1,4 +1,4 @@
-import { ClipboardCheck, Route, PanelLeft, PanelRight, Plus, Minus, Maximize2, Undo2, Redo2 } from 'lucide-react'
+import { ClipboardCheck, PanelLeft, PanelRight, Plus, Minus, Maximize2, Undo2, Redo2 } from 'lucide-react'
 import { useEffect, useMemo } from 'react'
 import NumberFlow from '@number-flow/react'
 import { Toaster, toast } from 'sonner'
@@ -9,7 +9,12 @@ import { Palette } from '../panels/Palette'
 import { Inspector } from '../panels/Inspector'
 import { iconBtn } from '../panels/ui'
 import { HoverTooltip } from '../panels/Tooltip'
+import { startChallengeJudge } from './challengeActions'
+import { useChallenges } from '../store/challengeStore'
 import { TraceCard } from '../panels/TraceCard'
+import { TraceMenu } from '../panels/TraceMenu'
+import { ChallengeBanner } from '../panels/ChallengePanel'
+import { TraceSummaryCard } from '../panels/TraceSummaryCard'
 import { useTrace } from '../sim/traceStore'
 import { SloMeter } from '../panels/SloMeter'
 import { Timeline } from '../panels/Timeline'
@@ -57,7 +62,7 @@ function TopBar() {
         <Scenarios />
         <ChaosButton />
         <ChallengesButton />
-        <button onClick={() => useTrace.getState().start()} title="Trace one request through the system (or Shift-click a moving dot)" className="flex items-center gap-1.5 rounded-control border border-line/15 px-2.5 py-1.5 text-xs font-medium transition-colors hover:bg-line/10 active:scale-95"><Route size={13} className="text-accent" /> <span className="hidden lg:inline">Trace</span></button>
+        <TraceMenu />
         <ReviewButton />
         <span className="h-5 w-px bg-line/15" />
         <div className="flex items-center gap-1">
@@ -71,8 +76,9 @@ function TopBar() {
 }
 
 function ZoomControls() {
+  const wide = useChallenges((s) => !!s.activeId && s.tab === 'challenge') // the challenge panel is wider than the inspector
   return (
-    <div className="panel absolute bottom-[var(--dock)] right-3 z-20 flex flex-col p-1 md:right-[264px]" style={{ bottom: 'var(--dock)' }}>
+    <div className={`panel absolute bottom-[var(--dock)] right-3 z-20 flex flex-col p-1 ${wide ? 'md:right-[312px]' : 'md:right-[264px]'}`} style={{ bottom: 'var(--dock)' }}>
       <button className={iconBtn} onClick={() => sceneRef.current?.zoomBy(1.25)} aria-label="Zoom in"><Plus size={16} /></button>
       <button className={iconBtn} onClick={() => sceneRef.current?.zoomBy(0.8)} aria-label="Zoom out"><Minus size={16} /></button>
       <button className={iconBtn} onClick={() => sceneRef.current?.fit()} aria-label="Fit to view"><Maximize2 size={16} /></button>
@@ -106,6 +112,7 @@ function MetricsStrip() {
       <div className="flex h-10 items-center gap-6 overflow-x-auto px-4 whitespace-nowrap">
       <Metric label="p50" spark={h.p50}><NumberFlow value={p50} format={whole} /> ms</Metric>
       <Metric label="p99" tone={p99 > 1000 ? 'bad' : p99 > 400 ? 'warn' : 'ok'} spark={h.p99}><NumberFlow value={p99} format={whole} /> ms</Metric>
+      {(totals?.netMs ?? 0) >= 1 && <Metric label="network"><NumberFlow value={totals?.netMs ?? 0} format={whole} /> ms <span className="text-[10px] text-dim">of p50</span></Metric>}
       <Metric label="err" tone={err > 5 ? 'bad' : err > 1 ? 'warn' : 'ok'} spark={h.err}><NumberFlow value={err} format={{ maximumFractionDigits: 1, minimumFractionDigits: 1 }} />%</Metric>
       {(totals?.blocked ?? 0) >= 0.5 && <Metric label="blocked"><NumberFlow value={totals?.blocked ?? 0} format={whole} /> rps</Metric>}
       <Metric label="rps" spark={h.rps}><NumberFlow value={totals?.throughput ?? 0} format={whole} /></Metric>
@@ -149,7 +156,7 @@ function useShortcuts() {
   })
   useHotkeys('escape', () => {
     if (sceneRef.current?.cancelConnect()) return
-    if (useTrace.getState().trace) { useTrace.getState().clear(); return }
+    if (useTrace.getState().trace || useTrace.getState().summary) { useTrace.getState().clear(); return }
     st().select(null)
   })
   useHotkeys('mod+d', (e) => { e.preventDefault(); const id = st().selectedId; if (id) st().duplicateComponent(id) })
@@ -165,6 +172,7 @@ function useShortcuts() {
 export default function App() {
   useShortcuts()
   useEffect(() => startSim(), [])
+  useEffect(() => startChallengeJudge(), [])
   useEffect(() => startAutosave(), [])
   useEffect(() => {
     openSharedFromHash() // a link opened in a new tab
@@ -180,7 +188,9 @@ export default function App() {
       <ZoomControls />
       <MetricsStrip />
       <EmptyState />
+      <ChallengeBanner />
       <TraceCard />
+      <TraceSummaryCard />
       <InsightCard />
       <ReviewDialog />
       <ChaosDialog />

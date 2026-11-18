@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { toast } from 'sonner'
 import { designChanged, useStore } from '../store/useStore'
+import { runLocked } from '../store/challengeStore'
 import { accumulate, sloOf, zeroCounters, type Counters } from './slo'
 import { analyze, type Insight } from './insight'
 import { planScenario, type ScenarioId, type ScenarioPlan } from './scenarios'
@@ -13,6 +14,24 @@ const TICK_MS = 100
 const HISTORY = 60
 
 export const SPEEDS = [0.5, 1, 2, 4] as const
+
+/**
+ * A challenge run owns the incident and the traffic: while it plays, they cannot be changed by hand. The challenge
+ * controller starts and stops its own incident through `withChallengeControl`.
+ */
+let challengeControl = false
+export function withChallengeControl<T>(fn: () => T): T {
+  challengeControl = true
+  try { return fn() } finally { challengeControl = false }
+}
+const refused = () => {
+  if (!runLocked() || challengeControl) return false
+  toast('A challenge run is playing', { id: 'run-locked', description: 'Stop the run first to change the incident or the traffic.' })
+  return true
+}
+/** Lets a challenge in design mode turn Play into "start the run". Return true when the press was handled. */
+let playInterceptor: (() => boolean) | null = null
+export const setPlayInterceptor = (f: (() => boolean) | null) => { playInterceptor = f }
 
 /** Mutable, read directly by the canvas every frame (no React in the hot path). */
 export const live: { result: StepResult | null; running: boolean; speed: number; bottleneck: string | null } = { result: null, running: true, speed: 1, bottleneck: null }
@@ -113,11 +132,12 @@ export const useSim = create<SimUI>((set, get) => ({
   dismissedKey: null,
   scenario: null,
   experiment: null,
-  inject: (id, kind) => set((s) => ({ injected: { ...s.injected, [id]: kind } })),
-  restore: (id) => set((s) => { const next = { ...s.injected }; delete next[id]; return { injected: next } }),
-  restoreAll: () => set({ injected: {} }),
+  inject: (id, kind) => { if (refused()) return; set((s) => ({ injected: { ...s.injected, [id]: kind } })) },
+  restore: (id) => { if (refused()) return; set((s) => { const next = { ...s.injected }; delete next[id]; return { injected: next } }) },
+  restoreAll: () => { if (refused()) return; set({ injected: {} }) },
   dismissInsight: () => set((s) => ({ dismissedKey: s.insight?.key ?? null })),
   startScenario: (id) => {
+    if (refused()) return
     const plan = planScenario(useStore.getState().architecture, id)
     if (plan.empty) { toast(`Can't run "${plan.label}"`, { description: plan.empty }); return }
     const prev = get()
@@ -129,6 +149,7 @@ export const useSim = create<SimUI>((set, get) => ({
     fireIfDue()
   },
   startExperiment: (exp) => {
+    if (refused()) return
     if (!exp.events.length) { toast("Can't run an empty experiment", { description: 'Add at least one event first.' }); return }
     const prev = get()
     resetSim()
@@ -138,6 +159,7 @@ export const useSim = create<SimUI>((set, get) => ({
     applyExperiment()
   },
   stopExperiment: () => {
+    if (refused()) return
     const ex = get().experiment
     if (!ex) return
     const injected = { ...get().injected }
@@ -145,16 +167,17 @@ export const useSim = create<SimUI>((set, get) => ({
     set({ experiment: null, injected, shape: ex.exp.shape ? ex.prevShape : get().shape, dismissedKey: null })
   },
   stopScenario: () => {
+    if (refused()) return
     const sc = get().scenario
     if (!sc) return
     const injected = { ...get().injected }
     for (const id of Object.keys(sc.plan.injections)) delete injected[id]
     set({ scenario: null, injected, shape: sc.plan.shape ? sc.prevShape : get().shape, dismissedKey: null })
   },
-  toggle: () => { if (get().scrubT !== null) { get().goLive(); return } const running = !get().running; live.running = running; set({ running }) },
+  toggle: () => { if (playInterceptor?.()) return; if (get().scrubT !== null) { get().goLive(); return } const running = !get().running; live.running = running; set({ running }) },
   setSpeed: (speed) => { live.speed = speed; set({ speed }) },
-  setShape: (shape) => set({ shape }),
-  reset: () => { get().stopScenario(); get().stopExperiment(); resetSim() },
+  setShape: (shape) => { if (refused()) return; set({ shape }) },
+  reset: () => { if (refused()) return; get().stopScenario(); get().stopExperiment(); resetSim() },
 }))
 
 let state = freshState()

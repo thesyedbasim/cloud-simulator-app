@@ -1,3 +1,4 @@
+import { challengeLoad, useChallenges } from '../store/challengeStore'
 import { toast } from 'sonner'
 import { sceneRef } from '../canvas/CanvasView'
 import { useStore } from '../store/useStore'
@@ -21,6 +22,8 @@ function download(href: string, filename: string) {
 
 /** Make `arch` the current design: one undo step, fresh simulation, camera framed on it. */
 export function openDesign(arch: Architecture, message?: string) {
+  // opening anything else (a file, a preset, a blank design) ends the challenge in progress
+  if (useChallenges.getState().activeId && !challengeLoad.on) useChallenges.getState().abandon()
   const st = useStore.getState()
   st.loadArchitecture(arch)
   useSim.getState().stopScenario() // a scenario belongs to the design it was started on

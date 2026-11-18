@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { linkShortener } from '../presets/linkShortener'
+import type { Architecture } from '../store/types'
 import { freshState, step, type Injected, type TrafficShape } from './engine'
-import { sampleTrace, type Trace } from './trace'
+import { findTrace, sampleTrace, sampleTraces, type Trace } from './trace'
 
 function result(shape: TrafficShape = 'steady', injected?: Record<string, Injected>, seconds = 5) {
   let state = freshState()
@@ -56,6 +57,110 @@ describe('request tracing', () => {
   })
   it('totals the time spent at each hop', () => {
     const t = sampleTrace(linkShortener, calm, 9)! as Trace
-    expect(t.totalMs).toBeCloseTo(t.hops.reduce((a, h) => a + h.ms, 0), 6)
+    expect(t.totalMs).toBeCloseTo(t.hops.reduce((a, h) => a + h.ms + h.netMs, 0), 6)
+  })
+})
+
+describe('trace options', () => {
+  const calm = result()
+  const hot = result('spike', { app: 'killed' as Injected }, 8)
+  it('starts from the chosen client', () => {
+    expect(sampleTrace(linkShortener, calm, 7, undefined, 'client')!.hops[0].nodeId).toBe('client')
+  })
+  it('finds a failing request when something is failing', () => {
+    const r = findTrace(linkShortener, hot, 3, { outcome: 'fail', type: 'any' })
+    expect(r.matched).toBe(true)
+    expect(r.trace!.outcome).toBe('dropped')
+  })
+  it('says so when no request fails, and still returns a trace', () => {
+    const r = findTrace(linkShortener, calm, 3, { outcome: 'fail', type: 'any' })
+    expect(r.matched).toBe(false)
+    expect(r.trace).not.toBeNull()
+  })
+  it('a slow request is slower than a typical one', () => {
+    const slow = findTrace(linkShortener, calm, 5, { outcome: 'slow', type: 'any' })
+    const typical = Array.from({ length: 200 }, (_, i) => sampleTrace(linkShortener, calm, 900 + i)!.totalMs).sort((a, b) => a - b)[100]
+    expect(slow.matched).toBe(true)
+    expect(slow.trace!.totalMs).toBeGreaterThan(typical)
+  })
+  it('summarises many requests consistently', () => {
+    const s = sampleTraces(linkShortener, hot, 11, 100)!
+    expect(s.ok + s.dropped + s.blocked).toBe(s.n)
+    expect(s.n).toBe(100)
+    expect(s.failures.reduce((a, f) => a + f.count, 0)).toBe(s.dropped)
+    expect(s.p99).toBeGreaterThanOrEqual(s.p50)
+  })
+})
+
+describe('request types', () => {
+  const calm = result()
+  const cacheHops = (type: 'read' | 'write' | 'upload', n = 600) =>
+    Array.from({ length: n }, (_, i) => sampleTrace(linkShortener, calm, 500 + i, undefined, undefined, type)!).flatMap((t) => t.hops.filter((h) => h.kind === 'cache'))
+
+  it('reads are answered by the cache at about its hit rate', () => {
+    const hops = cacheHops('read')
+    const hits = hops.filter((h) => h.outcome === 'hit').length / hops.length
+    expect(hits).toBeGreaterThan(0.7)
+    expect(hits).toBeLessThan(0.9)
+  })
+  it('writes and uploads are never answered by the cache', () => {
+    for (const type of ['write', 'upload'] as const) {
+      const hops = cacheHops(type)
+      expect(hops.length).toBeGreaterThan(0)
+      expect(hops.some((h) => h.outcome === 'hit')).toBe(false)
+      expect(hops[0].note).toContain('not cacheable')
+    }
+  })
+  it('writes reach the database every time', () => {
+    const ts = Array.from({ length: 200 }, (_, i) => sampleTrace(linkShortener, calm, 800 + i, undefined, undefined, 'write')!)
+    expect(ts.every((t) => t.hops[t.hops.length - 1].kind === 'database')).toBe(true)
+    expect(ts[0].type).toBe('write')
+  })
+  it('an upload heads for storage when the design has a bucket', () => {
+    const withBucket: Architecture = {
+      ...linkShortener,
+      components: [...linkShortener.components, { id: 'files', kind: 'bucket', name: 'Files', position: { col: 12, row: 3 }, config: {} }],
+      connections: [...linkShortener.connections, { id: 'c5', from: 'app', to: 'files' }],
+    }
+    let state = freshState()
+    let last = step(withBucket, state, 0, { shape: 'steady' })
+    for (let i = 0; i < 50; i++) { last = step(withBucket, state, 0.1, { shape: 'steady' }); state = last.state }
+    const ts = Array.from({ length: 100 }, (_, i) => sampleTrace(withBucket, last.result, 40 + i, undefined, undefined, 'upload')!)
+    expect(ts.every((t) => t.hops[t.hops.length - 1].nodeId === 'files' || t.outcome !== 'ok')).toBe(true)
+    expect(ts.some((t) => t.hops.some((h) => h.nodeId === 'files'))).toBe(true)
+  })
+  it('during a failover writes fail but reads still get through', () => {
+    const replicated: Architecture = {
+      ...linkShortener,
+      components: linkShortener.components.map((c) => (c.id === 'db' ? { ...c, config: { ...c.config, replicas: 2, failoverSec: 30 } } : c)),
+    }
+    let state = freshState()
+    let last = step(replicated, state, 0, { shape: 'steady', injected: { db: 'killed' } })
+    for (let i = 0; i < 30; i++) { last = step(replicated, state, 0.1, { shape: 'steady', injected: { db: 'killed' } }); state = last.state }
+    expect(last.result.nodes.db.failover?.phase).toBe('failing')
+    const run = (type: 'read' | 'write') => Array.from({ length: 300 }, (_, i) => sampleTrace(replicated, last.result, 70 + i, undefined, undefined, type)!)
+    const writes = run('write')
+    expect(writes.every((t) => t.outcome === 'dropped')).toBe(true)
+    expect(writes[0].summary).toContain('writes fail')
+    expect(run('read').filter((t) => t.outcome === 'ok').length).toBeGreaterThan(0)
+  })
+  it('a typical request keeps the original behaviour', () => {
+    expect(sampleTrace(linkShortener, calm, 42)!.type).toBe('any')
+    expect(sampleTrace(linkShortener, calm, 42)).toEqual(sampleTrace(linkShortener, calm, 42, undefined, undefined, 'any'))
+  })
+  it('summarises a type', () => {
+    expect(sampleTraces(linkShortener, calm, 3, 50, undefined, 'write')!.type).toBe('write')
+  })
+})
+
+describe('traces match the aggregate cache behaviour', () => {
+  it('a typical request is answered by the cache at the share the simulation reports, even for a write-heavy client', () => {
+    const arch: Architecture = { ...linkShortener, components: linkShortener.components.map((c) => (c.id === 'client' ? { ...c, config: { ...c.config, readPct: 0.5 } } : c)) }
+    let state = freshState()
+    let last = step(arch, state, 0, { shape: 'steady' })
+    for (let i = 0; i < 50; i++) { last = step(arch, state, 0.1, { shape: 'steady' }); state = last.state }
+    const hops = Array.from({ length: 1500 }, (_, i) => sampleTrace(arch, last.result, 300 + i)!).flatMap((t) => t.hops.filter((h) => h.kind === 'cache'))
+    const rate = hops.filter((h) => h.outcome === 'hit').length / hops.length
+    expect(rate).toBeCloseTo(last.result.nodes.cache.hit, 1)
   })
 })

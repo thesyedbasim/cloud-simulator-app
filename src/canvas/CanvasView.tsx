@@ -8,7 +8,7 @@ import { KIND_INFO, type ComponentKind } from '../store/types'
 
 export const sceneRef: { current: Scene | null } = { current: null }
 
-const CONNECT_MSG = { self: "A component can't connect to itself", duplicate: 'Already connected', reverse: 'Already connected the other way' } as const
+const CONNECT_MSG = { self: "A component can't connect to itself", duplicate: 'Already connected', reverse: 'Already connected the other way', locked: '' } as const
 
 export function CanvasView() {
   const host = useRef<HTMLDivElement>(null)
@@ -29,7 +29,7 @@ export function CanvasView() {
       },
       onConnect: (from, to) => {
         const r = st().addConnection(from, to)
-        if (r !== 'ok') toast(CONNECT_MSG[r])
+        if (r !== 'ok' && r !== 'locked') toast(CONNECT_MSG[r])
       },
     })
     sceneRef.current = scene
