@@ -1,7 +1,9 @@
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  // Simulation-heavy tests run several full designs per test and pass 5 s under parallel load.
+  test: { testTimeout: 30000 },
 })
